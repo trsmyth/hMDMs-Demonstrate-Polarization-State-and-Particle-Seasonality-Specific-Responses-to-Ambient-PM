@@ -1,0 +1,1213 @@
+---
+title: "Seahorse XF Assay - Figures 2 and 3"
+author: "Timothy Smyth"
+date: "2024-03-21"
+output: html_document
+---
+
+# Analysis of Agilent Seahorse XF Assay PM Groups
+
+### Load packages
+
+```{r message = FALSE}
+rm(list = ls(all.names = TRUE)) # clears global environ.
+
+# Load packages
+library(tidyverse) # for data cleaning
+library(dplyr) # for data set manipulations
+library(stringr)
+library(pheatmap) # for making heatmap
+library(viridis) # for heatmap color scheme
+library(ggfortify) # for PCA
+library(factoextra) # for PCA 
+library(ggrepel) # for pca text labeling
+library(ggplot2) # for plotting
+library(RColorBrewer) # for color pallette
+library(ggpubr) # for statistics and graphing
+library(corrr) # for correlation matrix
+library(ggcorrplot) # for correlation matrix plot
+library(rstatix)
+library(patchwork)
+library(cowplot)
+```
+
+### Import and prepare data
+
+```{r}
+# Import data
+OCR <- read.csv("OCR.csv")
+ECAR <- read.csv("ECAR.csv")
+
+colnames(OCR)[1] <- 'Particle_month'
+colnames(ECAR)[1] <- 'Particle_month'
+
+OCR$Full.Name <- paste0(OCR$Sample.ID, "_", OCR$Treatment, "_", OCR$Particle_month)
+ECAR$Full.Name <- paste0(ECAR$Sample.ID, "_", ECAR$Treatment, "_", ECAR$Particle_month)
+
+# Make data frames
+OCR <- data.frame(OCR, row.names = OCR$Full.Name)
+ECAR <- data.frame(ECAR, row.names = ECAR$Full.Name)
+
+# Calculate mean values for each biological replicate for each injection phase
+Basal_OCR <- rowMeans(subset(OCR[4:6]))
+Glucose_OCR <- rowMeans(subset(OCR[7:9]))
+Oligo_OCR <- rowMeans(subset(OCR[10:12]))
+FCCP_OCR <- rowMeans(subset(OCR[13:15]))
+ROT_OCR <- rowMeans(subset(OCR[16:18]))
+
+# Merge mean results into one data frame, adding Treatment ID as column
+OCR_means <- data.frame(OCR$Treatment, Basal_OCR, Glucose_OCR, Oligo_OCR, FCCP_OCR, ROT_OCR)
+colnames(OCR_means) <- c('Treatment', 'Basal', 'Glucose', 'Oligomycin', 'FCCP', 'Rot.Aa')
+
+# Repeat for ECAR measurements
+Basal_ECAR <- rowMeans(subset(ECAR[4:6]))
+Glucose_ECAR <- rowMeans(subset(ECAR[7:9]))
+Oligo_ECAR <- rowMeans(subset(ECAR[10:12]))
+FCCP_ECAR <- rowMeans(subset(ECAR[13:15]))
+ROT_ECAR <- rowMeans(subset(ECAR[16:18]))
+
+ECAR_means <- data.frame(ECAR$Treatment, Basal_ECAR, Glucose_ECAR, Oligo_ECAR, FCCP_ECAR, ROT_ECAR)
+colnames(ECAR_means) <- c('Treatment', 'Basal', 'Glucose', 'Oligomycin', 'FCCP', 'Rot.Aa')
+
+###################################################################################################
+
+# Calculate Seahorse values from data frames created above
+# See following citation for description/method of analysis:
+# Van den Bossche, Jan, Jeroen Baardman, and Menno PJ de Winther. 
+# "Metabolic characterization of polarized M1 and M2 bone marrow-derived 
+# macrophages using real-time extracellular flux analysis." 
+# JoVE (Journal of Visualized Experiments) 105 (2015): e53424.
+
+###################################################################################################
+```
+
+### Calculate OCR fold changes
+
+```{r}
+# OCR Calculations
+Basal_Respiration <- OCR_means$Glucose - OCR_means$Rot.Aa
+Maximum_Respiration <- OCR_means$FCCP - OCR_means$Rot.Aa
+SRC <- OCR_means$FCCP - OCR_means$Glucose
+
+# Assemble results into data frames 
+OCR <- data.frame(OCR$Particle_month, OCR$Sample.ID, 
+                  OCR_means, Basal_Respiration, 
+                  Maximum_Respiration, SRC)
+
+OCR$Group <- 'NA'
+OCR <- OCR %>% select(Group, everything()) %>% 
+  mutate(Group = 
+           case_when(str_detect(Treatment, 'Veh') ~ 'Veh', 
+                     str_detect(Treatment, 'M1') &
+                       str_detect(Treatment, 'PM') ~ 'M1+PM', 
+                     str_detect(Treatment, 'M1') ~ 'M1', 
+                     str_detect(Treatment, 'PM') ~ 'PM'))
+
+OCR <- OCR %>% subset(select = -c(Basal, 
+                                  Glucose, 
+                                  Oligomycin, 
+                                  FCCP, 
+                                  Rot.Aa))
+
+OCR$OCR.Particle_month[OCR$OCR.Particle_month == 'Sept'] <- 'September'
+OCR$OCR.Particle_month[OCR$OCR.Particle_month == 'Dec'] <- 'December'
+
+OCR$OCR.Particle_month <- factor(OCR$OCR.Particle_month, 
+                                              levels = c('December', 'March', 'June', 'September'))
+
+M0 <- OCR %>% subset(Treatment == 'M0_Veh' | Treatment == 'M0_PM')
+M1 <- OCR %>% subset(Treatment == 'M0_M1' | Treatment == 'M0_M1+PM')
+M2 <- OCR %>% subset(Treatment == 'M2_Veh' | Treatment == 'M2_PM')
+M2_M1 <- OCR %>% subset(Treatment == 'M2_M1' | Treatment == 'M2_M1+PM')
+
+FC <- list(M0, M1, M2, M2_M1)
+
+FC <- lapply(FC, function(x){
+  
+  tmp1 <- x %>% subset(Group == 'Veh' | Group == 'M1') %>% subset(select = -c(1:4))
+  tmp2 <- x %>% subset(Group == 'PM' | Group == 'M1+PM') 
+  
+  info <- tmp2[1:4]
+  
+  tmp2 <- tmp2[5:length(tmp2)]
+  tmp3 <- tmp2/tmp1
+  
+  rows <- rownames(tmp3)
+  
+  tmp3 <- data.frame(info, tmp3)
+
+  tmp3 <- tmp3 %>% pivot_longer(cols = colnames(tmp3[5:length(tmp3)]),
+                                names_to = 'Endpoint',
+                                values_to = 'Value')
+
+  tmp3
+  
+})
+
+FC <- do.call(rbind, FC)
+
+FC$Treatment <- factor(FC$Treatment, 
+                       levels = c('M0_PM', 'M2_PM',
+                                  'M0_M1+PM', 'M2_M1+PM'))
+
+FC$OCR.Particle_month <- factor(FC$OCR.Particle_month, 
+                            levels = c('December', 'March', 'June', 'September'))
+
+FC$OCR.Sample.ID <- paste0(FC$OCR.Sample.ID, '_', FC$OCR.Particle_month)
+
+FC$Value[FC$Endpoint == 'SRC' & 
+           FC$OCR.Sample.ID == 'NBL_310_September'] <- NA
+
+save(FC, 
+     file = 'Fold_Change_OCR.RData')
+```
+
+### Calculate OCR cumulative scoring
+
+```{r}
+list <- as.list(unique(FC$Endpoint))
+
+Scoring <- lapply(list, function(x){
+  
+  # Isolate a single endpoint
+  tmp <- FC %>% subset(Endpoint == x) %>% 
+    arrange(OCR.Sample.ID) %>%    
+    mutate(Treatment = factor(Treatment, 
+                              levels = c('M0_PM', 'M2_PM', 
+                                         'M0_M1+PM', 'M2_M1+PM')))
+  na_values  <- tmp %>%
+    filter(is.na(Value)) %>% data.frame()
+  
+  if(nrow(na_values) != 0){ 
+         rownames(na_values) = paste0(na_values$OCR.Sample.ID, 
+                                      '_', 
+                                      na_values$Treatment)
+  }
+  
+  na_values <- na_values[, 6, drop = FALSE]
+  colnames(na_values) <- x
+  
+  tmp <- data.frame(na.omit(tmp))
+  
+  rownames(tmp) <- paste0(tmp$OCR.Sample.ID, '_', tmp$Treatment)
+  
+  Samples <- paste0(tmp$OCR.Sample.ID, '_', tmp$Treatment)
+  
+  Score <- lapply(Samples, function(y){
+    
+    Score <- data.frame(
+      (tmp[y, 'Value'] - min(tmp$Value))/
+        (max(tmp$Value) - min(tmp$Value)),
+      row.names = y)
+    
+    colnames(Score) <- x
+    
+    Score
+    
+  })
+  
+  Score <- do.call(rbind, Score)
+  
+  if(nrow(na_values) != 0){ 
+         Score <- rbind(Score, 
+                        na_values)
+  }
+  
+  else{Score}
+  
+  Score$names <- rownames(Score)
+  Score
+
+})
+
+Scoring <- plyr::join_all(Scoring, by = 'names', type = 'full')
+Scoring <- data.frame(Scoring, row.names = Scoring$names) %>% subset(select = -c(names))
+
+Total_Score <- data.frame(Score = rowSums(Scoring), 
+                          row.names = rownames(Scoring))
+```
+
+### Calculate statistics for cumulative OCR scoring
+
+```{r}
+Sample_data <- FC %>% pivot_wider(names_from = 'Endpoint', 
+                                  values_from = 'Value') %>% 
+  subset(select = c(OCR.Particle_month, OCR.Sample.ID, Treatment)) %>% data.frame()
+
+rownames(Sample_data) <- paste0(Sample_data$OCR.Sample.ID, 
+                                      '_', 
+                                      Sample_data$Treatment)
+
+Total_Score <- data.frame(Sample_data[rownames(Total_Score), ], Total_Score) %>% 
+  na.omit() %>%
+  arrange(Treatment)
+
+Shapiro <- Total_Score %>%
+    group_by(Treatment) %>% 
+    do(broom::tidy(shapiro.test(.$Score)))
+
+# Run a Wilcox test with BH correction
+stats <- rstatix::pairwise_t_test(Score ~ Treatment, 
+                                  paired = TRUE, 
+                                  p.adjust.method = "BH", 
+                                  data = Total_Score)
+
+# Round resulting p-values to 3 digits
+stats$adj.p.value <- round(stats$p.adj, 3)
+        
+# Convert adjusted p values to significance symbols
+stats <- stats %>% mutate(adj.p.value =
+                            case_when((adj.p.value >= 0.05) ~ NA,
+                                      
+                                      (adj.p.value < 0.05 &
+                                         adj.p.value >= 0.01) ~ '*',
+                                      
+                                      (adj.p.value < 0.01 &
+                                         adj.p.value >= 0.001) ~ '**',
+                                      
+                                      (adj.p.value < 0.001) ~ '***'))
+
+if(all(is.na(stats[, 'adj.p.value'])) == TRUE){
+      
+      stats$pos_x_1 <- 0
+      stats$pos_x_2 <- 0
+      stats$pos_x <- 0
+      stats$pos_y <- 0
+      stats
+      
+      } else{
+        
+        stats <- na.omit(stats)
+        
+        stats <- stats %>% mutate(pos_x_1 =
+                                    case_when((group1 == 'M0_PM') ~ 1,
+                                              (group1 == 'M2_PM') ~ 2,
+                                              (group1 == 'M0_M1+PM') ~ 3,
+                                              (group1 == 'M2_M1+PM') ~ 4))
+        
+        stats <- stats %>% mutate(pos_x_2 =
+                                    case_when((group2 == 'M0_PM') ~ 1,
+                                              (group2 == 'M2_PM') ~ 2,
+                                              (group2 == 'M0_M1+PM') ~ 3,
+                                              (group2 == 'M2_M1+PM') ~ 4))
+        
+        stats$pos_x <- (stats$pos_x_1 + stats$pos_x_2)/2
+        
+        stats$pos_y <- seq(from = 0.25,
+                           to = 0.25 * nrow(stats), 
+                           0.25)
+        }
+```
+
+### Graph cumulative OCR scoring - Supplemental Figure S4A
+
+```{r}
+plot <- ggplot(Total_Score, 
+               aes(x = Treatment, 
+                   y = Score)) +
+  
+    # Create a bar 
+    geom_bar(aes(col = Treatment),
+             fill = 'white',
+             position = position_dodge(),
+             stat = "summary",
+             fun = "mean") +
+
+    # Create individual points for each data point
+    # Set data point shapes to shapes indicated above
+    geom_jitter(aes(col = Treatment),
+               stat = "identity",
+               alpha = .8,
+               size = 4,
+               width = 0.3, 
+               show.legend = FALSE) +
+
+    # Add SEM bars
+    stat_summary(geom = "errorbar",
+                 fun.data = mean_se,
+                 position = "dodge") +
+  
+  ylab("OCR Cumulative Score") +
+  
+  labs(fill = "Particle Month") +
+  
+  theme(axis.text.y = element_text(face="bold", 
+                                   size = 26), 
+        
+        axis.text.x = element_text(face="bold", 
+                                   size = 26),
+        
+        axis.title.y = element_text(face = 'bold', 
+                                    size = 30), 
+        
+        axis.title.x = element_blank(),
+
+        plot.margin = unit(c(0, 0, 0, 0), "cm")) +
+
+  scale_x_discrete(limits = c('M0_PM', 'M2_PM', 'M0_M1+PM', 'M2_M1+PM'))
+
+###
+
+Statistics <- ggplot(data = stats, 
+                     aes(x = group1,
+                         y = pos_y)) +
+  
+  geom_segment(data = na.omit(stats), 
+               aes(x = group1, 
+                   xend = group2,
+                   y = pos_y, 
+                   yend = pos_y), 
+               colour = "black", 
+               linewidth = 1.25) +
+  
+  geom_text(data = stats,
+            label = stats$adj.p.value,
+            x = stats$pos_x,
+            y = stats$pos_y,
+            size = 15,
+            colour = "black") +
+  
+  ylab("OCR Cumulative Score") +
+  
+  labs(fill = "Particle Month") +
+  
+  theme(axis.text.y = element_text(face="bold", 
+                                   size = 26), 
+        
+        axis.title.y = element_text(face = 'bold', 
+                                    size = 30), 
+        
+        axis.text.x = element_blank(),
+
+        axis.title.x = element_blank(),
+
+        plot.margin = unit(c(0, 0, 0, 0), "cm")) +
+
+  scale_x_discrete(limits = c('M0_PM', 'M2_PM', 'M0_M1+PM', 'M2_M1+PM')) +
+  scale_y_continuous(limits = c(0, max(stats$pos_y) + 0.25))
+
+##########
+
+tiff('OCR_Score.tiff', height = 1000, width = 1500)
+
+wrap_plots(Statistics +  
+             theme_void(),
+           plot + 
+             theme(legend.position = "none"), 
+           ncol = 1,
+           heights = c(0.4, 2)) %>% 
+  ggdraw()
+
+dev.off()
+```
+
+### Calculate statistics for cumulative OCR scoring by particle month
+
+```{r}
+list <- as.list(unique(Total_Score$Treatment))
+
+Month_Stats <- lapply(list, function(y){
+    
+    # Isolate individual treatment from an individual endpoint
+    tmp <- Total_Score %>% subset(Treatment == y)
+
+     # Run Shapiro-Wilk normality test 
+    # Testing each particle month within a single treatment group to determine 
+    # if each falls within a normal distribution for downstream statistical testing 
+    Shapiro <- tmp %>%
+      group_by(OCR.Particle_month) %>% 
+      do(broom::tidy(shapiro.test(.$Score)))
+    
+    # If the treatment group has a normal distribution
+    # perform a paired t-test with BH correction
+    if(min(Shapiro$p.value) >= 0.05){
+      
+      # Run pairwise t-test with BH correction
+      stats <- rstatix::pairwise_t_test(Score ~ OCR.Particle_month, 
+                                        paired = FALSE, 
+                                        p.adjust.method = "BH", 
+                                        data = tmp)
+      
+      # Round resulting p-values to 3 digits
+      stats$adj.p.value <- round(stats$p.adj, 3)
+      
+      # Convert adjusted p values to significance symbols
+      stats <- stats %>% mutate(adj.p.value = 
+                                  case_when((adj.p.value >= 0.05) ~ NA,
+                                            
+                                            (adj.p.value < 0.05 &
+                                               adj.p.value >= 0.01) ~ '*', 
+                                            
+                                            (adj.p.value < 0.01 &
+                                               adj.p.value >= 0.001) ~ '**',
+                                            
+                                            (adj.p.value < 0.001) ~ '***'))
+      
+      stats$test <- 't.test'
+      stats <- stats[, -c(7)] # Remove p.sigif to retain only adj.p.value
+      stats$Treatment <- y
+      stats
+      
+      } else{ # If treatment group does not have a normal distribution
+        
+        # Run a Wilcox test with BH correction
+        stats <- rstatix::pairwise_wilcox_test(Score ~ OCR.Particle_month, 
+                                               paired = FALSE, 
+                                               p.adjust.method = "BH", 
+                                               data = tmp)
+        
+        # Round resulting p-values to 3 digits
+        stats$adj.p.value <- round(stats$p.adj, 3)
+        
+        # Convert adjusted p values to significance symbols
+        stats <- stats %>% mutate(adj.p.value =
+                                    case_when((adj.p.value >= 0.05) ~ NA,
+                                              
+                                              (adj.p.value < 0.05 &
+                                                 adj.p.value >= 0.01) ~ '*',
+                                              
+                                              (adj.p.value < 0.01 &
+                                                 adj.p.value >= 0.001) ~ '**',
+                                              
+                                              (adj.p.value < 0.001) ~ '***'))
+        
+        stats$test <- 'Wilcox'
+        stats <- stats[, -c(6)] # Remove p.sigif to retain only adj.p.value
+        stats$Treatment <- y
+        stats
+        
+      }
+    
+    if(all(is.na(stats[, 'adj.p.value'])) == TRUE){
+      
+      stats$pos_x_1 <- 0
+      stats$pos_x_2 <- 0
+      stats$pos_x <- 0
+      stats$pos_y <- 0
+      stats
+      
+      } else{
+        
+        stats <- na.omit(stats)
+        
+        stats <- stats %>% mutate(pos_x_1 =
+                                    case_when((group1 == 'December') ~ 1,
+                                              (group1 == 'March') ~ 2,
+                                              (group1 == 'June') ~ 3,
+                                              (group1 == 'September') ~ 4))
+        
+        stats <- stats %>% mutate(pos_x_2 =
+                                    case_when((group2 == 'December') ~ 1,
+                                              (group2 == 'March') ~ 2,
+                                              (group2 == 'June') ~ 3,
+                                              (group2 == 'September') ~ 4))
+        
+        stats$pos_x <- (stats$pos_x_1 + stats$pos_x_2)/2
+        
+        stats$pos_y <- seq(from = 0.25,
+                           to = 0.25 * nrow(stats), 
+                           0.25)
+        
+        stats
+      }
+})
+
+stats <- do.call(rbind, Month_Stats)
+```
+
+### Graph cumulative OCR scoring by particle month - Supplemental Figure S4C
+
+```{r}
+plot <- ggplot(Total_Score, 
+               aes(x = OCR.Particle_month, 
+                   y = Score)) +
+  
+    # Create a bar 
+    geom_bar(aes(col = OCR.Particle_month),
+             fill = 'white',
+             position = position_dodge(),
+             stat = "summary",
+             fun = "mean") +
+
+    # Create individual points for each data point
+    # Set data point shapes to shapes indicated above
+    geom_jitter(aes(col = OCR.Particle_month),
+               stat = "identity",
+               alpha = .8,
+               size = 4,
+               width = 0.3, 
+               show.legend = FALSE) +
+
+    # Add SEM bars
+    stat_summary(geom = "errorbar",
+                 fun.data = mean_se,
+                 position = "dodge") +
+  
+  facet_wrap(~Treatment, nrow = 1) +
+  
+  ylab("OCR Cumulative Score") +
+  
+  labs(fill = "Particle Month") +
+  
+  theme(axis.text.x = element_text(angle = 60, 
+                                   hjust = 1, 
+                                   face="bold", 
+                                   size = 26),
+        
+        axis.text.y = element_text(face="bold", 
+                                   size = 26), 
+        
+        axis.title.x = element_blank(),
+        
+        axis.title.y = element_text(face = 'bold', 
+                                    size = 30), 
+        
+        plot.title = element_text(face = 'bold', 
+                                  size = 26),
+        
+        strip.text.x = element_text(size = 20),
+        
+        legend.text = element_text(size = 20),
+        
+        legend.title = element_text(size = 20),
+        
+        plot.margin = unit(c(0, 0, 0, 0), "cm")) +
+    
+    scale_color_manual(name = 'Particle Month', 
+                       breaks = c('December', 'March', 'June', 'September'),
+                       values = c('December' = 'blue', 'March' = 'red', 
+                                  'June' = 'darkgreen', 'September' = 'purple')) +
+
+  scale_x_discrete(limits = c('December', 'March', 'June', 'September'))
+
+###
+
+Statistics <- ggplot(data = stats, 
+                     aes(x = group1,
+                         y = pos_y)) +
+  
+  geom_segment(data = na.omit(stats), 
+               aes(x = group1, 
+                   xend = group2,
+                   y = pos_y, 
+                   yend = pos_y), 
+               colour = "black", 
+               linewidth = 1.25) +
+  
+  geom_text(data = stats,
+            label = stats$adj.p.value,
+            x = stats$pos_x,
+            y = stats$pos_y,
+            size = 15,
+            colour = "black") +
+  
+  facet_wrap(~factor(Treatment, 
+                     levels = c('M0_PM', 'M2_PM', 
+                                'M0_M1+PM', 'M2_M1+PM')), 
+             nrow = 1) +
+  
+  ylab("OCR Cumulative Score") +
+  
+  labs(fill = "Particle Month") +
+  
+  theme(axis.text.x = element_text(angle = 60, 
+                                   hjust = 1, 
+                                   face="bold", 
+                                   size = 26),
+        
+        axis.text.y = element_text(face="bold", 
+                                   size = 26), 
+        
+        axis.title.x = element_blank(),
+        
+        axis.title.y = element_text(face = 'bold', 
+                                    size = 30), 
+        
+        plot.title = element_text(face = 'bold', 
+                                  size = 26),
+        
+        legend.text = element_text(size = 20),
+        
+        legend.title = element_text(size = 20),
+        
+        plot.margin = unit(c(0, 0, 0, 0), "cm")) +
+    
+    scale_x_discrete(limits = c('December', 'March', 'June', 'September')) +
+    scale_y_continuous(limits = c(0, max(stats$pos_y) + 0.25))
+
+##########
+
+tiff('OCR_Month_Score.tiff', height = 1000, width = 1500)
+
+wrap_plots(Statistics +  
+             theme_void(),
+           plot + 
+             theme(legend.position = "none"), 
+           ncol = 1,
+           heights = c(0.4, 2)) %>% 
+  ggdraw()
+
+dev.off()
+```
+
+### Calculate ECAR fold changes
+
+```{r}
+# ECAR Calculations
+Glycolysis <- ECAR_means$Glucose - ECAR_means$Basal
+Maximum_Glycolytic_Rate <- ECAR_means$Oligomycin - ECAR_means$Basal
+Glycolytic_Reserve <- ECAR_means$Oligomycin - ECAR_means$Glucose
+
+
+# Assemble results into data frames 
+ECAR <- data.frame(ECAR$Particle_month, ECAR$Sample.ID,
+                   ECAR_means, Glycolysis, 
+                   Maximum_Glycolytic_Rate, Glycolytic_Reserve)
+
+ECAR$Group <- 'NA'
+ECAR <- ECAR %>% select(Group, everything()) %>% 
+  mutate(Group = case_when(str_detect(Treatment, 'Veh') ~ 'Veh',
+                           str_detect(Treatment, 'M1') &
+                             str_detect(Treatment, 'PM') ~ 'M1+PM', 
+                           str_detect(Treatment, 'M1') ~ 'M1', 
+                           str_detect(Treatment, 'PM') ~ 'PM'))
+                                                  
+ECAR <- ECAR %>% subset(select = -c(Basal, Glucose, Oligomycin, FCCP, Rot.Aa))
+
+ECAR$ECAR.Particle_month[ECAR$ECAR.Particle_month == 'Sept'] <- 'September'
+ECAR$ECAR.Particle_month[ECAR$ECAR.Particle_month == 'Dec'] <- 'December'
+
+ECAR$ECAR.Particle_month <- factor(ECAR$ECAR.Particle_month, 
+                                              levels = c('December', 'March', 'June', 'September'))
+
+M0 <- ECAR %>% subset(Treatment == 'M0_Veh' | Treatment == 'M0_PM')
+M1 <- ECAR %>% subset(Treatment == 'M0_M1' | Treatment == 'M0_M1+PM')
+M2 <- ECAR %>% subset(Treatment == 'M2_Veh' | Treatment == 'M2_PM')
+M2_M1 <- ECAR %>% subset(Treatment == 'M2_M1' | Treatment == 'M2_M1+PM')
+
+FC <- list(M0, M1, M2, M2_M1)
+
+FC <- lapply(FC, function(x){
+  
+  tmp1 <- x %>% subset(Group == 'Veh' | Group == 'M1') %>% subset(select = -c(1:4))
+  tmp2 <- x %>% subset(Group == 'PM' | Group == 'M1+PM') 
+  
+  info <- tmp2[1:4]
+  
+  tmp2 <- tmp2[5:length(tmp2)]
+  tmp3 <- tmp2/tmp1
+  
+  rows <- rownames(tmp3)
+  
+  tmp3 <- data.frame(info, tmp3)
+  
+  tmp3 <- tmp3 %>% pivot_longer(cols = colnames(tmp3[5:length(tmp3)]),
+                                names_to = 'Endpoint',
+                                values_to = 'Value')
+  
+  tmp3
+  
+})
+
+FC <- do.call(rbind, FC)
+
+FC$Treatment <- factor(FC$Treatment, 
+                       levels = c('M0_PM', 'M2_PM',
+                                  'M0_M1+PM', 'M2_M1+PM'))
+
+FC$ECAR.Particle_month <- factor(FC$ECAR.Particle_month, 
+                                levels = c('December', 'March', 'June', 'September'))
+
+FC$ECAR.Sample.ID <- paste0(FC$ECAR.Sample.ID, '_', FC$ECAR.Particle_month)
+
+FC$Value[FC$Endpoint == 'Maximum_Glycolytic_Rate' & 
+           FC$ECAR.Sample.ID == 'NBL_280_June'] <- NA
+```
+
+### Calculate ECAR cumulative scoring
+
+```{r}
+list <- as.list(unique(FC$Endpoint))
+
+Scoring <- lapply(list, function(x){
+  
+  # Isolate a single endpoint
+  tmp <- FC %>% subset(Endpoint == x) %>% 
+    arrange(ECAR.Sample.ID) %>%    
+    mutate(Treatment = factor(Treatment, 
+                              levels = c('M0_PM', 'M2_PM', 
+                                         'M0_M1+PM', 'M2_M1+PM')))
+  na_values  <- tmp %>%
+    filter(is.na(Value)) %>% data.frame()
+  
+  if(nrow(na_values) != 0){ 
+         rownames(na_values) = paste0(na_values$ECAR.Sample.ID, 
+                                      '_', 
+                                      na_values$Treatment)
+  }
+  
+  na_values <- na_values[, 6, drop = FALSE]
+  colnames(na_values) <- x
+  
+  tmp <- data.frame(na.omit(tmp))
+  
+  rownames(tmp) <- paste0(tmp$ECAR.Sample.ID, '_', tmp$Treatment)
+  
+  Samples <- paste0(tmp$ECAR.Sample.ID, '_', tmp$Treatment)
+  
+  Score <- lapply(Samples, function(y){
+    
+    Score <- data.frame(
+      (tmp[y, 'Value'] - min(tmp$Value))/
+        (max(tmp$Value) - min(tmp$Value)),
+      row.names = y)
+    
+    colnames(Score) <- x
+    
+    Score
+    
+  })
+  
+  Score <- do.call(rbind, Score)
+  
+  if(nrow(na_values) != 0){ 
+         Score <- rbind(Score, 
+                        na_values)
+  }
+  
+  else{Score}
+  
+  Score$names <- rownames(Score)
+  Score
+
+})
+
+Scoring <- plyr::join_all(Scoring, by = 'names', type = 'full')
+Scoring <- data.frame(Scoring, row.names = Scoring$names) %>% subset(select = -c(names))
+
+Total_Score <- data.frame(Score = rowSums(Scoring), 
+                          row.names = rownames(Scoring))
+```
+
+### Calculate statistics for cumulative ECAR scoring
+
+```{r}
+Sample_data <- FC %>% pivot_wider(names_from = 'Endpoint', 
+                                  values_from = 'Value') %>% 
+  subset(select = c(ECAR.Particle_month, ECAR.Sample.ID, Treatment)) %>% data.frame()
+
+rownames(Sample_data) <- paste0(Sample_data$ECAR.Sample.ID, 
+                                      '_', 
+                                      Sample_data$Treatment)
+
+Total_Score <- data.frame(Sample_data[rownames(Total_Score), ], Total_Score) %>% 
+  na.omit() %>%
+  arrange(Treatment)
+
+Shapiro <- Total_Score %>%
+    group_by(Treatment) %>% 
+    do(broom::tidy(shapiro.test(.$Score)))
+
+# Run a Wilcox test with BH correction
+stats <- rstatix::pairwise_wilcox_test(Score ~ Treatment, 
+                                       paired = TRUE,
+                                       p.adjust.method = "BH", 
+                                       data = Total_Score)
+
+# Round resulting p-values to 3 digits
+stats$adj.p.value <- round(stats$p.adj, 3)
+        
+# Convert adjusted p values to significance symbols
+stats <- stats %>% mutate(adj.p.value =
+                            case_when((adj.p.value >= 0.05) ~ NA,
+                                      
+                                      (adj.p.value < 0.05 &
+                                         adj.p.value >= 0.01) ~ '*',
+                                      
+                                      (adj.p.value < 0.01 &
+                                         adj.p.value >= 0.001) ~ '**',
+                                      
+                                      (adj.p.value < 0.001) ~ '***'))
+
+if(all(is.na(stats[, 'adj.p.value'])) == TRUE){
+      
+      stats$pos_x_1 <- 0
+      stats$pos_x_2 <- 0
+      stats$pos_x <- 0
+      stats$pos_y <- 0
+      stats
+      
+      } else{
+        
+        stats <- na.omit(stats)
+        
+        stats <- stats %>% mutate(pos_x_1 =
+                                    case_when((group1 == 'M0_PM') ~ 1,
+                                              (group1 == 'M2_PM') ~ 2,
+                                              (group1 == 'M0_M1+PM') ~ 3,
+                                              (group1 == 'M2_M1+PM') ~ 4))
+        
+        stats <- stats %>% mutate(pos_x_2 =
+                                    case_when((group2 == 'M0_PM') ~ 1,
+                                              (group2 == 'M2_PM') ~ 2,
+                                              (group2 == 'M0_M1+PM') ~ 3,
+                                              (group2 == 'M2_M1+PM') ~ 4))
+        
+        stats$pos_x <- (stats$pos_x_1 + stats$pos_x_2)/2
+        
+        stats$pos_y <- seq(from = 0.25,
+                           to = 0.25 * nrow(stats), 
+                           0.25)
+        }
+```
+
+### Graph cumulative ECAR scoring - Supplemental Figure S4B
+
+```{r}
+plot <- ggplot(Total_Score, 
+               aes(x = Treatment, 
+                   y = Score)) +
+  
+    # Create a bar 
+    geom_bar(aes(col = Treatment),
+             fill = 'white',
+             position = position_dodge(),
+             stat = "summary",
+             fun = "mean") +
+
+    # Create individual points for each data point
+    # Set data point shapes to shapes indicated above
+    geom_jitter(aes(col = Treatment),
+               stat = "identity",
+               alpha = .8,
+               size = 4,
+               width = 0.3, 
+               show.legend = FALSE) +
+
+    # Add SEM bars
+    stat_summary(geom = "errorbar",
+                 fun.data = mean_se,
+                 position = "dodge") +
+  
+  ylab("ECAR Cumulative Score") +
+  
+  labs(fill = "Particle Month") +
+  
+  theme(axis.text.y = element_text(face="bold", 
+                                   size = 26), 
+        
+        axis.text.x = element_text(face="bold", 
+                                   size = 26),
+        
+        axis.title.y = element_text(face = 'bold', 
+                                    size = 30), 
+        
+        axis.title.x = element_blank(),
+
+        plot.margin = unit(c(0, 0, 0, 0), "cm")) +
+
+  scale_x_discrete(limits = c('M0_PM', 'M2_PM', 'M0_M1+PM', 'M2_M1+PM'))
+
+###
+
+Statistics <- ggplot(data = stats, 
+                     aes(x = group1,
+                         y = pos_y)) +
+  
+  geom_segment(data = na.omit(stats), 
+               aes(x = group1, 
+                   xend = group2,
+                   y = pos_y, 
+                   yend = pos_y), 
+               colour = "black", 
+               linewidth = 1.25) +
+  
+  geom_text(data = stats,
+            label = stats$adj.p.value,
+            x = stats$pos_x,
+            y = stats$pos_y,
+            size = 15,
+            colour = "black") +
+  
+  ylab("ECAR Cumulative Score") +
+  
+  labs(fill = "Particle Month") +
+  
+  theme(axis.text.y = element_text(face="bold", 
+                                   size = 26), 
+        
+        axis.title.y = element_text(face = 'bold', 
+                                    size = 30), 
+        
+        axis.text.x = element_blank(),
+
+        axis.title.x = element_blank(),
+
+        plot.margin = unit(c(0, 0, 0, 0), "cm")) +
+
+  scale_x_discrete(limits = c('M0_PM', 'M2_PM', 'M0_M1+PM', 'M2_M1+PM')) +
+  scale_y_continuous(limits = c(0, max(stats$pos_y) + 0.25))
+
+##########
+
+tiff('ECAR_Score.tiff', height = 1000, width = 1500)
+
+wrap_plots(Statistics +  
+             theme_void(),
+           plot + 
+             theme(legend.position = "none"), 
+           ncol = 1,
+           heights = c(0.4, 2)) %>% 
+  ggdraw()
+
+dev.off()
+```
+
+### Calculate statistics for cumulative OCR scoring by particle month
+
+```{r}
+list <- as.list(unique(Total_Score$Treatment))
+
+Month_Stats <- lapply(list, function(y){
+    
+    # Isolate individual treatment from an individual endpoint
+    tmp <- Total_Score %>% subset(Treatment == y)
+
+     # Run Shapiro-Wilk normality test 
+    # Testing each particle month within a single treatment group to determine 
+    # if each falls within a normal distribution for downstream statistical testing 
+    Shapiro <- tmp %>%
+      group_by(ECAR.Particle_month) %>% 
+      do(broom::tidy(shapiro.test(.$Score)))
+    
+    # If the treatment group has a normal distribution
+    # perform a paired t-test with BH correction
+    if(min(Shapiro$p.value) >= 0.05){
+      
+      # Run pairwise t-test with BH correction
+      stats <- rstatix::pairwise_t_test(Score ~ ECAR.Particle_month, 
+                                        paired = FALSE, 
+                                        p.adjust.method = "BH", 
+                                        data = tmp)
+      
+      # Round resulting p-values to 3 digits
+      stats$adj.p.value <- round(stats$p.adj, 3)
+      
+      # Convert adjusted p values to significance symbols
+      stats <- stats %>% mutate(adj.p.value = 
+                                  case_when((adj.p.value >= 0.05) ~ NA,
+                                            
+                                            (adj.p.value < 0.05 &
+                                               adj.p.value >= 0.01) ~ '*', 
+                                            
+                                            (adj.p.value < 0.01 &
+                                               adj.p.value >= 0.001) ~ '**',
+                                            
+                                            (adj.p.value < 0.001) ~ '***'))
+      
+      stats$test <- 't.test'
+      stats <- stats[, -c(7)] # Remove p.sigif to retain only adj.p.value
+      stats$Treatment <- y
+      stats
+      
+      } else{ # If treatment group does not have a normal distribution
+        
+        # Run a Wilcox test with BH correction
+        stats <- rstatix::pairwise_wilcox_test(Score ~ ECAR.Particle_month, 
+                                               paired = FALSE, 
+                                               p.adjust.method = "BH", 
+                                               data = tmp)
+        
+        # Round resulting p-values to 3 digits
+        stats$adj.p.value <- round(stats$p.adj, 3)
+        
+        # Convert adjusted p values to significance symbols
+        stats <- stats %>% mutate(adj.p.value =
+                                    case_when((adj.p.value >= 0.05) ~ NA,
+                                              
+                                              (adj.p.value < 0.05 &
+                                                 adj.p.value >= 0.01) ~ '*',
+                                              
+                                              (adj.p.value < 0.01 &
+                                                 adj.p.value >= 0.001) ~ '**',
+                                              
+                                              (adj.p.value < 0.001) ~ '***'))
+        
+        stats$test <- 'Wilcox'
+        stats <- stats[, -c(6)] # Remove p.sigif to retain only adj.p.value
+        stats$Treatment <- y
+        stats
+        
+      }
+    
+    if(all(is.na(stats[, 'adj.p.value'])) == TRUE){
+      
+      stats$pos_x_1 <- 0
+      stats$pos_x_2 <- 0
+      stats$pos_x <- 0
+      stats$pos_y <- 0
+      stats
+      
+      } else{
+        
+        stats <- na.omit(stats)
+        
+        stats <- stats %>% mutate(pos_x_1 =
+                                    case_when((group1 == 'December') ~ 1,
+                                              (group1 == 'March') ~ 2,
+                                              (group1 == 'June') ~ 3,
+                                              (group1 == 'September') ~ 4))
+        
+        stats <- stats %>% mutate(pos_x_2 =
+                                    case_when((group2 == 'December') ~ 1,
+                                              (group2 == 'March') ~ 2,
+                                              (group2 == 'June') ~ 3,
+                                              (group2 == 'September') ~ 4))
+        
+        stats$pos_x <- (stats$pos_x_1 + stats$pos_x_2)/2
+        
+        stats$pos_y <- seq(from = 0.25,
+                           to = 0.25 * nrow(stats), 
+                           0.25)
+        
+        stats
+      }
+})
+
+stats <- do.call(rbind, Month_Stats)
+```
+
+### Graph cumulative ECAR scoring by particle month - Supplemental Figure S4D
+
+```{r}
+plot <- ggplot(Total_Score, 
+               aes(x = ECAR.Particle_month, 
+                   y = Score)) +
+  
+    # Create a bar 
+    geom_bar(aes(col = ECAR.Particle_month),
+             fill = 'white',
+             position = position_dodge(),
+             stat = "summary",
+             fun = "mean") +
+
+    # Create individual points for each data point
+    # Set data point shapes to shapes indicated above
+    geom_jitter(aes(col = ECAR.Particle_month),
+               stat = "identity",
+               alpha = .8,
+               size = 4,
+               width = 0.3, 
+               show.legend = FALSE) +
+
+    # Add SEM bars
+    stat_summary(geom = "errorbar",
+                 fun.data = mean_se,
+                 position = "dodge") +
+  
+  facet_wrap(~Treatment, nrow = 1) +
+  
+  ylab("ECAR Cumulative Score") +
+  
+  labs(fill = "Particle Month") +
+  
+  theme(axis.text.x = element_text(angle = 60, 
+                                   hjust = 1, 
+                                   face="bold", 
+                                   size = 26),
+        
+        axis.text.y = element_text(face="bold", 
+                                   size = 26), 
+        
+        axis.title.x = element_blank(),
+        
+        axis.title.y = element_text(face = 'bold', 
+                                    size = 30), 
+        
+        plot.title = element_text(face = 'bold', 
+                                  size = 26),
+        
+        strip.text.x = element_text(size = 20),
+        
+        legend.text = element_text(size = 20),
+        
+        legend.title = element_text(size = 20),
+        
+        plot.margin = unit(c(0, 0, 0, 0), "cm")) +
+    
+    scale_color_manual(name = 'Particle Month', 
+                       breaks = c('December', 'March', 'June', 'September'),
+                       values = c('December' = 'blue', 'March' = 'red', 
+                                  'June' = 'darkgreen', 'September' = 'purple')) +
+
+  scale_x_discrete(limits = c('December', 'March', 'June', 'September'))
+
+###
+
+Statistics <- ggplot(data = stats, 
+                     aes(x = group1,
+                         y = pos_y)) +
+  
+  geom_segment(data = na.omit(stats), 
+               aes(x = group1, 
+                   xend = group2,
+                   y = pos_y, 
+                   yend = pos_y), 
+               colour = "black", 
+               linewidth = 1.25) +
+  
+  geom_text(data = stats,
+            label = stats$adj.p.value,
+            x = stats$pos_x,
+            y = stats$pos_y,
+            size = 15,
+            colour = "black") +
+  
+  facet_wrap(~factor(Treatment, 
+                     levels = c('M0_PM', 'M2_PM', 
+                                'M0_M1+PM', 'M2_M1+PM')), 
+             nrow = 1) +
+  
+  ylab("ECAR Cumulative Score") +
+  
+  labs(fill = "Particle Month") +
+  
+  theme(axis.text.x = element_text(angle = 60, 
+                                   hjust = 1, 
+                                   face="bold", 
+                                   size = 26),
+        
+        axis.text.y = element_text(face="bold", 
+                                   size = 26), 
+        
+        axis.title.x = element_blank(),
+        
+        axis.title.y = element_text(face = 'bold', 
+                                    size = 30), 
+        
+        plot.title = element_text(face = 'bold', 
+                                  size = 26),
+        
+        legend.text = element_text(size = 20),
+        
+        legend.title = element_text(size = 20),
+        
+        plot.margin = unit(c(0, 0, 0, 0), "cm")) +
+    
+    scale_x_discrete(limits = c('December', 'March', 'June', 'September')) +
+    scale_y_continuous(limits = c(0, max(stats$pos_y) + 0.25))
+
+##########
+
+tiff('ECAR_Month_Score.tiff', height = 1000, width = 1500)
+
+wrap_plots(Statistics +  
+             theme_void(),
+           plot + 
+             theme(legend.position = "none"), 
+           ncol = 1,
+           heights = c(0.4, 2)) %>% 
+  ggdraw()
+
+dev.off()
+```

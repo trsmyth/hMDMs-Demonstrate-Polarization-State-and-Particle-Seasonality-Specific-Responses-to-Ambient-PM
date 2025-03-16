@@ -1,0 +1,2101 @@
+---
+title: "MSD Analysis"
+author: "Timothy Smyth"
+date: "2024-03-21"
+output: html_document
+---
+
+# Analysis of MSD experiments
+
+### Load packages 
+
+```{r message = FALSE}
+rm(list = ls(all.names = TRUE)) # clears global environ.
+
+# Load packages
+library(tidyverse) # for data cleaning
+library(ggplot2) # for plotting
+library(RColorBrewer) # for color palette
+library(tibble)
+library(tidyverse)
+library(dplyr) 
+library(parallelpam)
+library(RColorBrewer)
+library(ComplexHeatmap)
+library(circlize)
+library(digest)
+library(cluster)
+library(factoextra)
+library(patchwork)
+library(cowplot)
+```
+
+### Import and format data
+
+```{r}
+# Import data
+MSD <- read.csv("MSD.csv")
+
+colnames(MSD) <- c('Sample', 'Assay', 'Well', 'Spot', 
+                   'Dilution', 'Concentration', 'Signal', 'Adjusted_signal', 
+                   'Mean', 'Adj_signal_mean', 'CV', 'Percent_recovery', 
+                   'Percent_Recovery_mean', 'Calc_conc', 'Calc_conc_mean', 'Calc_conc_CV')
+
+# Remove Pro-inflammatory panel IL-8 as Chemokine IL-8 has much higher max concentration
+MSD <- MSD %>% filter(Assay != "IL-8" | Spot != '6')
+
+MSD$Month <- 'NA'
+
+MSD <- MSD %>% dplyr::select(Month, everything())
+
+# Remove unneeded variables
+MSD <- MSD %>% subset(select = -c(Well, Spot, Dilution, Concentration, 
+                                  Adjusted_signal, Mean, Signal, Adj_signal_mean, CV, 
+                                  Percent_recovery, Percent_Recovery_mean, Calc_conc_mean, Calc_conc_CV))
+
+# 289 and 290 shared between two PM groups. Those are already marked 
+# with their month, so it is used below instead of the number
+MSD <- MSD %>% mutate(Month =
+                        case_when(str_detect(Sample, '191') |
+                                    str_detect(Sample, '303') |  
+                                    str_detect(Sample, 'Mar') |
+                                    str_detect(Sample, '291') |
+                                    str_detect(Sample, '132') ~ 'March', 
+                                  
+                                  str_detect(Sample, 'Jun') | 
+                                    str_detect(Sample, '273') |
+                                    str_detect(Sample, '280') |
+                                    str_detect(Sample, '292') |
+                                    str_detect(Sample, '288') ~ 'June', 
+                                  
+                                  str_detect(Sample, '312') |
+                                    str_detect(Sample, '379') |
+                                    str_detect(Sample, 'Sept') |
+                                    str_detect(Sample, '308') |
+                                    str_detect(Sample, '310') ~ 'September', 
+                                  
+                                  str_detect(Sample, 'Dec') |
+                                    str_detect(Sample, '375') |
+                                    str_detect(Sample, '285') |
+                                    str_detect(Sample, '314') |
+                                    str_detect(Sample, '388') ~ 'December'))
+
+MSD$Group <- 'NA'
+MSD <- MSD %>% dplyr::select(Group, everything())
+
+# Rename groups
+MSD <- MSD %>% mutate(Group = 
+                        case_when(str_detect(Sample, 'M0_Veh') ~ 'M0_Veh', 
+                                  str_detect(Sample, 'M2_Veh') ~ 'M2_Veh',
+                                  
+                                  str_detect(Sample, 'M0_M1') & str_detect(Sample, '\\+') ~ 'M0_M1+PM',
+                                  str_detect(Sample, 'M2_M1') & str_detect(Sample, '\\+') ~ 'M2_M1+PM',
+                                  
+                                  str_detect(Sample, 'M0_M1') ~ 'M0_M1',
+                                  str_detect(Sample, 'M2_M1') ~ 'M2_M1',
+                                  
+                                  str_detect(Sample, 'M0_PM') ~ 'M0_PM',
+                                  str_detect(Sample, 'M2_PM') ~ 'M2_PM'))
+
+MSD$Treatment <- 'NA'
+MSD <- MSD %>% dplyr::select(Treatment, everything())
+
+MSD <- MSD %>% mutate(Treatment = 
+                        case_when(str_detect(Sample, 'Veh') ~ 'Veh', 
+                                  str_detect(Sample, 'M1') & str_detect(Sample, '\\+') ~ 'M1+PM',
+                                  str_detect(Sample, 'M1') ~ 'M1',
+                                  str_detect(Sample, 'PM') ~ 'PM',
+                        ))
+
+MSD$Starting <- 'NA'
+MSD <- MSD %>% dplyr::select(Starting, everything())
+
+# Mark sample as starting as M0 or M2
+MSD <- MSD %>% mutate(Starting = 
+                        case_when(str_detect(Sample, 'M0') ~ 'M0', 
+                                  str_detect(Sample, 'M2') ~ 'M2'))
+
+# Set row names to sample and assay to prepare for pivot
+MSD <- data.frame(MSD, row.names = paste0(MSD$Sample, "_", MSD$Assay))
+
+# Pivot wider so each column is an analyte
+MSD <- pivot_wider(MSD, names_from = Assay, values_from = Calc_conc)
+
+# Set to data frame with row names as sample ID
+MSD <- data.frame(MSD, row.names = MSD$Sample)
+
+# Set up Month and Group column to ID experimental clustering below
+MSD$Month_Group <- paste0(MSD$Month, "_", MSD$Group)
+MSD <- MSD %>% dplyr::select(Month_Group, everything())
+
+# Remove IFN-y and IL-4 due to presence in polarization/treatment media
+MSD <- MSD %>% subset(select = -c(IFN.γ, IL.4))
+
+# Remove IP-10 and MCP-4 since so many were above LOD
+MSD <- MSD %>% subset(select = -c(IP.10, MCP.4))
+
+MSD$Month <- factor(MSD$Month, 
+                    levels = c('March', 
+                               'June', 
+                               'September', 
+                               'December'))
+```
+
+### Generation of average cytokine/chemokine levels by treatment group - Figure 4A
+
+```{r message = FALSE}
+info <- MSD[1:6]
+
+# Group samples by treatment group and calculate mean values
+mean_MSD <- MSD[c(4, 7:ncol(MSD))] %>% group_by(Group) %>% summarize(across(everything(), mean))
+
+# Scale data
+heat <- scale(data.frame(mean_MSD[2:ncol(mean_MSD)], row.names = mean_MSD$Group))
+
+# Perform PAM clustering
+parallelpam::JWriteBin(as.matrix(t(heat)),
+                       "MDM_mean.bin", 
+                       dtype = "float", 
+                       dmtype = "full")
+
+CalcAndWriteDissimilarityMatrix("MDM_mean.bin", 
+                                "MDM_mean2.bin",
+                                distype = "L2", 
+                                restype = "float",
+                                comment = "L2 distance for vectors in jmatrix file vst_mean.bin", 
+                                nthreads = 8)
+
+JMatInfo("MDM_mean2.bin")
+
+MDM_results_pam = ApplyPAM("MDM_mean2.bin", 
+                           k = 4,
+                           init_method = "BUILD", 
+                           max_iter = 1000, 
+                           nthreads = 8)
+
+# Set color scheme for heatmap
+myCol <- colorRamp2(c(-3, 0, 3), hcl_palette = "RdBu")
+
+Group <- factor(unique(info$Group), 
+                levels = c('M0_Veh',
+                           'M2_Veh', 
+                           'M0_PM',
+                           'M2_PM',
+                           'M0_M1',
+                           'M2_M1',
+                           'M0_M1+PM',
+                           'M2_M1+PM'))
+
+# Create annotation data frame
+annotation <- data.frame(
+  Group = Group,
+  stringsAsFactors = FALSE)
+
+colors <- list(
+  
+  Group = c('M0_Veh' = 'cornflowerblue',
+            'M2_Veh' = 'forestgreen', 
+            'M0_PM' = 'cadetblue2',
+            'M2_PM' = 'darkseagreen3',
+            'M0_M1' = 'tomato3',
+            'M2_M1' = 'orange3',
+            'M0_M1+PM' = 'tomato1',
+            'M2_M1+PM' = 'orange1'))
+
+colAnn <- HeatmapAnnotation(
+  df = annotation,
+  name = ' ',
+  which = 'col', # 'col' (samples) or 'row' (gene) annotation?
+  col = colors,
+  annotation_height = 0.6,
+  annotation_width = unit(1, 'cm'),
+  gap = unit(1, 'mm'),
+  show_legend = TRUE)
+
+hmap <- Heatmap(as.matrix(t(heat)),
+                
+                 # split the genes / rows according to the PAM clusters
+                 row_split = MDM_results_pam$clasif,
+                 column_split = unique(info$Group),
+                 cluster_row_slices = FALSE,
+                 gap = unit(2.5, "mm"),
+                 column_gap = unit(2.5, 'mm'),
+                 border = TRUE,
+                 height = ncol(heat) * unit(20, 'mm'),
+                 width = ncol(heat) * unit(15, 'mm'),
+
+                name = 'Z-Score',
+                
+                col = myCol,
+                
+                # Add value of each cell to the heatmap
+                # Change the text color depending on the value of the cell
+                cell_fun = function(j, i, x, y, width, height, fill) {
+                  grid.text(sprintf("%.1f", heat[j, i]), x, y, gp = gpar(fontsize = 24, 
+                                                                            col = if_else(heat[j, i] < 1.5 & 
+                                                                                            heat[j, i] > -1.5 | 
+                                                                                            is.na(heat[j, i]) == TRUE, 
+                                                                                          'black', 
+                                                                                          'white'),
+                                                                            fontface = 'bold'))},
+                
+                # parameters for the color-bar that represents gradient of expression
+                 heatmap_legend_param = list(
+                   color_bar = 'continuous',
+                   legend_direction = 'horizontal',
+                   at = c(-3, -1.5, 0, 1.5, 3),
+                   legend_width = unit(20, 'cm'),
+                   legend_height = unit(30, 'cm'),
+                   title_position = 'topcenter',
+                   title_gp = gpar(fontsize = 30, fontface = 'bold'),
+                   labels_gp = gpar(fontsize = 25, fontface = 'bold')),
+                 
+                 # row (gene) parameters
+                 cluster_rows = TRUE,
+                 show_row_dend = TRUE,
+                 row_title_side = 'left',
+                 row_title_gp = gpar(fontsize = 0,  fontface = 'bold'),
+                 row_title_rot = 0,
+                 show_row_names = TRUE,
+                 row_names_gp = gpar(fontsize = 18, fontface = 'bold'),
+                 row_names_side = 'left',
+                 row_dend_width = unit(25,'mm'),
+                 
+                 # column (sample) parameters
+                 cluster_columns = TRUE,
+                 show_column_dend = TRUE,
+                 column_title = NULL,
+                 show_column_names = FALSE,
+                 column_names_gp = gpar(fontsize = 10, fontface = 'bold'),
+                 column_names_max_height = unit(10, 'cm'),
+                 column_dend_height = unit(25,'mm'),
+                 column_names_rot = 45,
+                 
+                 # cluster methods for rows and columns
+                 clustering_distance_columns = function(x) as.dist(1 - cor(t(x))),
+                 clustering_method_columns = 'ward.D2',
+                 clustering_distance_rows = function(x) as.dist(1 - cor(t(x))),
+                 clustering_method_rows = 'ward.D2',
+                 
+                 # specify top and bottom annotations
+                 top_annotation = colAnn)
+                 
+png(file = "All_Groups_Heatmap.png", height = 3000, width = 2000)
+
+draw(hmap,
+     heatmap_legend_side = "bottom", 
+     annotation_legend_side = "right", 
+     legend_grouping = "original")
+
+dev.off()
+```
+
+### Generation of PCA plot by treatment group - Figure 4B
+
+```{r}
+PCA <- data.frame(MSD[1:6], log(MSD[7:ncol(MSD)]))
+
+col <- c('cornflowerblue',
+         'forestgreen',
+         'tomato3',
+         'orange3', 
+         'cadetblue2',
+         'darkseagreen3',
+         'tomato1',
+         'orange1')
+
+
+# Set value for shapes to be used below
+shapes <- c(18, 18, 18, 18, 
+            9, 9, 9, 9,
+            15, 15, 15, 15,
+            12, 12, 12, 12)
+
+# Set groups to factor with following order
+PCA$Group <- factor(PCA$Group,
+                    levels = c('M0_Veh', 'M2_Veh', 
+                               'M0_M1', 'M2_M1', 
+                               'M0_PM', 'M2_PM',
+                               'M0_M1+PM', 'M2_M1+PM'))
+
+# Set groups to factor with following order
+PCA$Month <- factor(PCA$Month, 
+                    levels = c('December', 'March', 'June', 'September'))
+
+#############################
+
+fviz_pca_ind(prcomp(PCA[7:ncol(PCA)], center = TRUE, scale = TRUE),
+             label = "var", 
+             col.var = "grey50",
+             habillage = PCA$Group, 
+             palette = col,
+             addEllipses = TRUE, 
+             ellipse.type = 'confidence', 
+             repel = TRUE, 
+             ellipse.alpha = 0) + 
+                
+  ggtitle("PCA - Clustering") +
+  theme(axis.title = element_text(size = 14), 
+        axis.text = element_text(size = 12), 
+        plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+        panel.border = element_rect(fill = NA, color = "black", size = 0.3),
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_blank()) +
+  xlim(-10, 10) +
+  
+  # Add points for each group and color according to PM month
+  geom_point(aes(color = as.factor(PCA$Group),
+                 shape = as.factor(PCA$Group)),
+             size = 3, 
+             show.legend = FALSE) +
+  
+  # Manually set shapes to above indicated shapes
+  scale_shape_manual(values = shapes) 
+```
+
+### Group fold changes
+
+```{r}
+# Break up everything into their subgroups
+M0 <- MSD %>% subset(Group == 'M0_Veh' | Group == 'M0_PM')
+M1 <- MSD %>% subset(Group == 'M0_M1' | Group == 'M0_M1+PM')
+M2 <- MSD %>% subset(Group == 'M2_Veh' | Group == 'M2_PM')
+M2_M1 <- MSD %>% subset(Group == 'M2_M1' | Group == 'M2_M1+PM')
+
+# Compile into list for lapply
+FC <- list(M0, M1, M2, M2_M1)
+
+# Calculate the fold change of each treatment versus its related vehicle group
+FC <- lapply(FC, function(x){
+  
+  # Vehicles are Veh or _M1
+  # PM treatments are PM or M1+PM
+  tmp1 <- x %>% subset(Treatment == 'Veh' | Treatment == 'M1') %>% subset(select = -c(1:6))
+  tmp2 <- x %>% subset(Treatment == 'PM' | Treatment == 'M1+PM')
+  info <- tmp2[1:6]
+  tmp2 <- tmp2 %>% subset(select = -c(1:6))
+  
+  tmp3 <- tmp2/tmp1
+  
+  tmp3 <- cbind(info, tmp3)
+  tmp3 <- tmp3 %>% pivot_longer(cols = colnames(tmp3[7:length(tmp3)]), 
+                                names_to = 'Analyte', 
+                                values_to = 'Value')
+  
+})
+
+FC <- do.call(rbind, FC)
+
+MSD <- MSD %>% pivot_longer(cols = colnames(MSD[7:length(MSD)]), 
+                            names_to = 'Analyte', 
+                            values_to = 'Raw_Value')
+
+MSD <- MSD %>% subset(Treatment == 'PM' | Treatment == 'M1+PM')
+
+merge <- merge(FC, MSD)
+
+save(merge, 
+     file = 'Fold_Change_MSD.RData')
+
+merge <- merge %>% subset(Group == 'M0_M1+PM' |
+                            Group == 'M2_M1+PM')
+
+merge$Value <- log2(merge$Value)
+
+merge$Group <- factor(merge$Group, 
+                      levels = c('M0_Veh', 'M2_Veh', 
+                                 'M0_M1', 'M2_M1', 
+                                 'M0_PM', 'M2_PM',
+                                 'M0_M1+PM', 'M2_M1+PM'))
+                   
+merge$Month <- factor(merge$Month, 
+                      levels = c('December', 'March', 'June', 'September'))
+```
+
+### M1 fold change PCA Figure 5A
+
+```{r}
+M1_PCA <- FC %>% pivot_wider(names_from = 'Analyte', 
+                             values_from = 'Value') %>% 
+  subset(Group == 'M0_M1+PM'|
+           Group == 'M2_M1+PM')
+
+contrib <- fviz_contrib(prcomp(log(M1_PCA[7:ncol(M1_PCA)]), 
+                               center = TRUE, 
+                               scale = TRUE), 
+                        choice = "var", 
+                        axes = 1:2)
+
+contrib <- contrib$data %>% 
+  arrange(desc(contrib))
+
+contrib <- contrib[1:10, ]
+
+col <- c('cornflowerblue',
+         'tomato3')
+
+shapes <- c(15, 16, 17, 18, 
+            0, 1, 2, 5, 
+            6, 8)
+
+# Set groups to factor with following order
+M1_PCA$Group <- factor(M1_PCA$Group,
+                       levels = c('M0_Veh', 'M2_Veh', 
+                               'M0_M1', 'M2_M1', 
+                               'M0_PM', 'M2_PM',
+                               'M0_M1+PM', 'M2_M1+PM'))
+                    
+# Set groups to factor with following order
+M1_PCA$Month <- factor(M1_PCA$Month, levels = c('December', 'March', 'June', 'September'))
+
+#############################
+
+fviz_pca_biplot(prcomp(log(M1_PCA[7:ncol(M1_PCA)]), center = TRUE, scale = TRUE),
+                label = "var", 
+                col.var = "grey50",
+                habillage = M1_PCA$Group, 
+                palette = col,
+                addEllipses = TRUE, 
+                ellipse.type = 'confidence', 
+                repel = TRUE, 
+                ellipse.alpha = 0) + 
+  
+  ggtitle("PCA - Clustering") +
+  theme(axis.title = element_text(size = 14), 
+        axis.text = element_text(size = 12), 
+        plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+        panel.border = element_rect(fill = NA, color = "black", size = 0.3),
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_blank()) +
+  xlim(-10, 10) +
+  
+  # Add points for each group and color according to PM month
+  geom_point(aes(color = as.factor(M1_PCA$Group),
+                 shape = as.factor(M1_PCA$Group)),
+             size = 3, 
+             show.legend = FALSE) +
+  
+  # Manually set shapes to above indicated shapes
+  scale_shape_manual(values = shapes) 
+```
+
+### M1 fold change heatmap Figure 5B
+
+```{r}
+Heatmap <- FC %>% pivot_wider(names_from = 'Analyte', 
+                              values_from = 'Value')
+
+info <- unique(Heatmap[1:6] %>% subset(Group == 'M0_PM' | 
+                                         Group == 'M2_PM')) %>% 
+  arrange(Month) %>%
+  mutate(Month = factor(Month, 
+                        levels = c('December',
+                                   'March',
+                                   'June',
+                                   'September')))
+
+FC_mean_heat <- Heatmap %>% subset(Group == 'M0_M1+PM' | 
+                                     Group == 'M2_M1+PM') %>% 
+  group_by(Month_Group) %>% 
+  summarize(across(everything(), mean))
+
+FC_mean_heat <- data.frame(FC_mean_heat[7:length(FC_mean_heat)], 
+                           row.names = FC_mean_heat$Month_Group)
+
+FC_mean_heat <- FC_mean_heat[c(1, 5, 3, 7, 
+                               2, 6, 4, 8), ]
+
+FC_mean_heat <- t(scale(FC_mean_heat))
+
+# Perform PAM clustering
+parallelpam::JWriteBin(as.matrix(FC_mean_heat),
+                       "MDM_mean.bin", 
+                       dtype = "float", 
+                       dmtype = "full")
+
+CalcAndWriteDissimilarityMatrix("MDM_mean.bin", 
+                                "MDM_mean2.bin",
+                                distype = "L2", 
+                                restype = "float",
+                                comment = "L2 distance for vectors in jmatrix file vst_mean.bin", 
+                                nthreads = 8)
+
+JMatInfo("MDM_mean2.bin")
+
+MDM_results_pam = ApplyPAM("MDM_mean2.bin", 
+                           k = 4,
+                           init_method = "BUILD", 
+                           max_iter = 1000, 
+                           nthreads = 8)
+
+Group <- factor(str_sub(colnames(FC_mean_heat), 
+                        -8, 
+                        nchar(colnames(FC_mean_heat))), 
+                levels = c('M0_M1+PM',
+                           'M2_M1+PM'))
+
+Month <- factor(str_sub(colnames(FC_mean_heat), 
+                        1, 
+                        -10), 
+                levels = c('December',
+                           'March',
+                           'June',
+                           'September'))
+
+# Create annotation data frame
+annotation <- data.frame(
+  Group = Group, 
+  Month = Month,
+  stringsAsFactors = FALSE)
+
+colors <- list(
+  Group = c('M0_M1+PM' = 'cornflowerblue',
+            'M2_M1+PM' = 'tomato3'), 
+  
+  Month = c('December' = 'blue',
+            'March' = 'red',
+            'June' = 'green',
+            'September' = 'purple'))
+
+colAnn <- HeatmapAnnotation(
+  df = annotation,
+  name = ' ',
+  which = 'col', # 'col' (samples) or 'row' (gene) annotation?
+  col = colors,
+  annotation_height = 0.6,
+  annotation_width = unit(1, 'cm'),
+  gap = unit(1, 'mm'),
+  show_legend = TRUE)
+
+hmap2 <- Heatmap(FC_mean_heat,
+                 
+                 # split the genes / rows according to the PAM clusters
+                 row_split = MDM_results_pam$clasif,
+                 column_split = Group,
+                 cluster_row_slices = FALSE,
+                 gap = unit(2.5, "mm"),
+                 column_gap = unit(2.5, 'mm'),
+                 border = TRUE,
+                 height = ncol(FC_mean_heat) * unit(20, 'mm'),
+                 width = ncol(FC_mean_heat) * unit(15, 'mm'),
+                 
+                 name = 'Z-Score',
+
+                # Add value of each cell to the heatmap
+                # Change the text color depending on the value of the cell
+                cell_fun = function(j, i, x, y, width, height, fill) {
+                  grid.text(sprintf("%.1f", t(FC_mean_heat)[j, i]), x, y, gp = gpar(fontsize = 9, 
+                                                                         col = 'black',
+                                                                         fontface = 'bold'))},
+                
+                 col = myCol,
+                 
+                 # parameters for the color-bar that represents gradient of expression
+                 heatmap_legend_param = list(
+                   color_bar = 'continuous',
+                   legend_direction = 'horizontal',
+                   at = c(-3, -1.5, 0, 1.5, 3),
+                   legend_width = unit(8, 'cm'),
+                   legend_height = unit(5.0, 'cm'),
+                   title_position = 'topcenter',
+                   title_gp=gpar(fontsize = 12, fontface = 'bold'),
+                   labels_gp=gpar(fontsize = 12, fontface = 'bold')),
+                 
+                 # row (gene) parameters
+                 cluster_rows = TRUE,
+                 show_row_dend = TRUE,
+                 row_title_side = 'left',
+                 row_title_gp = gpar(fontsize = 0,  fontface = 'bold'),
+                 row_title_rot = 0,
+                 show_row_names = TRUE,
+                 row_names_gp = gpar(fontsize = 9, fontface = 'bold'),
+                 row_names_side = 'left',
+                 row_dend_width = unit(25,'mm'),
+                 
+                 # column (sample) parameters
+                 cluster_columns = FALSE,
+                 show_column_dend = FALSE,
+                 column_title = '',
+                 column_title_side = 'bottom',
+                 column_title_gp = gpar(fontsize = 10, fontface = 'bold'),
+                 show_column_names = FALSE,
+                 column_names_gp = gpar(fontsize = 10, fontface = 'bold'),
+                 column_names_max_height = unit(10, 'cm'),
+                 column_dend_height = unit(25,'mm'),
+                 
+                 # cluster methods for rows and columns
+                 clustering_distance_columns = function(x) as.dist(1 - cor(t(x))),
+                 clustering_method_columns = 'ward.D2',
+                 clustering_distance_rows = function(x) as.dist(1 - cor(t(x))),
+                 clustering_method_rows = 'ward.D2',
+                 
+                 # # specify top and bottom annotations
+                 top_annotation = colAnn)
+
+
+png(file = "M1_Groups_Mean_Heatmap.png", height = 800, width = 1000)
+
+draw(hmap2,
+     heatmap_legend_side = 'top')
+
+dev.off()
+```
+
+### M1 fold change statistics and graphing - Figure 5C-L
+
+```{r}
+list <- as.list(unique(as.character(contrib$name)))
+list2 <- as.list(unique(merge$Group))
+
+log_stats <- lapply(list, function(x){
+  
+  tmp <- merge %>% subset(Analyte == x) %>% 
+    arrange(Value) %>%    
+    mutate(Month = factor(Month, 
+                          levels = c('December', 'March', 'June', 'September')))
+  
+  tmp <- na.omit(tmp)
+  
+  tmp2 <- lapply(list2, function(y){
+    
+    tmp2 <- tmp %>% subset(Group == y)
+    
+    test <- tmp2 %>%
+      group_by(Month) %>% 
+      do(broom::tidy(shapiro.test(.$Value)))
+    
+    if(min(test$p.value) >= 0.05){
+      
+      stats <- rstatix::pairwise_t_test(Value ~ Month, 
+                                        paired = FALSE, 
+                                        p.adjust.method = "BH", 
+                                        data = tmp2)
+      
+      stats$adj.p.value <- round(stats$p.adj, 3)
+      
+      # Convert adjusted p values to significance symbols
+      stats <- stats %>% mutate(adj.p.value = 
+                                  case_when((adj.p.value >= 0.05) ~ NA,
+                                            
+                                            (adj.p.value < 0.05 &
+                                               adj.p.value >= 0.01) ~ '*', 
+                                            
+                                            (adj.p.value < 0.01 &
+                                               adj.p.value >= 0.001) ~ '**',
+                                            
+                                            (adj.p.value < 0.001) ~ '***'))
+      
+      stats$test <- 't.test'
+      stats <- stats[, -c(7)] # Remove p.sigif to retain only adj.p.value
+      stats$Treatment <- y
+      stats
+      
+      } else{ # If treatment group does not have a normal distribution
+        
+        # Run a Wilcox test with BH correction
+        stats <- rstatix::pairwise_wilcox_test(Value ~ Month, 
+                                               paired = FALSE, 
+                                               p.adjust.method = "BH", 
+                                               data = tmp2)
+        
+        # Round resulting p-values to 3 digits
+        stats$adj.p.value <- round(stats$p.adj, 3)
+        
+        # Convert adjusted p values to significance symbols
+        stats <- stats %>% mutate(adj.p.value =
+                                    case_when((adj.p.value >= 0.05) ~ NA,
+                                              
+                                              (adj.p.value < 0.05 &
+                                                 adj.p.value >= 0.01) ~ '*',
+                                              
+                                              (adj.p.value < 0.01 &
+                                                 adj.p.value >= 0.001) ~ '**',
+                                              
+                                              (adj.p.value < 0.001) ~ '***'))
+        
+        stats$test <- 'Wilcox'
+        stats <- stats[, -c(6)] # Remove p.sigif to retain only adj.p.value
+        stats$Treatment <- y
+        stats
+        
+      }
+    
+    if(all(is.na(stats[, 'adj.p.value'])) == TRUE){
+      
+      stats$pos_x_1 <- 0
+      stats$pos_x_2 <- 0
+      stats$pos_x <- 0
+      stats$pos_y <- 0
+      stats
+      
+      } else{
+        
+        stats <- na.omit(stats)
+        
+        stats <- stats %>% mutate(pos_x_1 =
+                                    case_when((group1 == 'December') ~ 1,
+                                              (group1 == 'March') ~ 2,
+                                              (group1 == 'June') ~ 3,
+                                              (group1 == 'September') ~ 4))
+        
+        stats <- stats %>% mutate(pos_x_2 =
+                                    case_when((group2 == 'December') ~ 1,
+                                              (group2 == 'March') ~ 2,
+                                              (group2 == 'June') ~ 3,
+                                              (group2 == 'September') ~ 4))
+        
+        stats$pos_x <- (stats$pos_x_1 + stats$pos_x_2)/2
+        
+        stats$pos_y <- seq(from = 0.25,
+                           to = 0.25 * nrow(stats), 
+                           0.25)
+        
+        stats
+      }
+    
+    })
+  
+  # Combine the statistics into one place
+  tmp <- do.call(rbind, tmp2)
+  tmp
+  
+  })
+
+names(log_stats) <- list
+
+# Define the shapes of each data point
+# Shapes are shared between biological replicates between treatment groups
+shapes <- c(15, 11, 15, 15, 16,
+            15, 17, 16, 15, 15,
+            16, 16, 16, 11, 17, 
+            17, 18, 18, 16, 15,
+            17, 16, 15, 11, 18,
+            17, 11, 11, 11, 18, 
+            17, 16, 18, 17, 11,
+            18, 18, 17, 11, 18)
+
+Figure_5_plots <- lapply(list, function(x){
+  
+  tmp <- merge %>% 
+    subset(Analyte == x) %>% 
+    arrange(Value) %>%    
+    mutate(Month = factor(Month, 
+                          levels = c('December', 'March', 'June', 'September')))
+  
+  tmp <- na.omit(tmp)
+  
+  max <- max(tmp$Value) * 1.05
+  
+  pos <- c(max, max * 1.15, max * 1.3, max * 1.45, max * 1.6, max * 1.75)
+  
+  ggplot(data = tmp, 
+         aes(x = Month, 
+             y = Value, 
+             fill = Group)) +
+    
+    geom_bar(aes(col = Month),
+             fill = 'white',
+             position = position_dodge(),
+             stat = "summary",
+             fun = "mean",
+             show.legend = FALSE) +
+    
+    geom_point(aes(col = Month,
+                   shape = Sample),
+               stat = "identity",
+               position = position_dodge(width = .9),
+               alpha = .8,
+               size = 8,
+               show.legend = FALSE) +
+    
+    # Add SEM bars
+    stat_summary(geom = "errorbar",
+                 fun.data = mean_se,
+                 position = "dodge") +
+    
+    facet_wrap(~factor(Group, 
+                       levels = c('M0_Veh', 'M2_Veh', 
+                                  'M0_M1', 'M2_M1', 
+                                  'M0_PM', 'M2_PM',
+                                  'M0_M1+PM', 'M2_M1+PM')),
+               nrow = 1) +
+    
+    # Label x and y axis
+    labs(title = NULL,
+         x = NULL, 
+         y = paste0('Log2 Fold Change \n Vehicle ', x, ' Concentration'),
+         fill = 'Particle Month') + 
+    
+    theme(axis.text.x = element_text(angle = 60, 
+                                   hjust = 1, 
+                                   face="bold", 
+                                   size = 30),
+        
+        axis.text.y = element_text(face="bold", 
+                                   size = 26), 
+        
+        axis.title.x = element_text(face = 'bold', 
+                                    size = 30), 
+        
+        axis.title.y = element_text(face = 'bold', 
+                                    size = 32),
+          
+          strip.text.x = element_text(size = 32),
+        
+        plot.margin = unit(c(0, 0, 0, 0), "cm")) +
+    
+    scale_color_manual(name = 'Particle Month', 
+                       breaks = c('December', 'March', 'June', 'September'),
+                       values = c('December' = 'blue', 'March' = 'red', 
+                                  'June' = 'darkgreen', 'September' = 'purple')) +
+    
+    scale_shape_manual(values = shapes)
+  
+})
+
+names(Figure_5_plots) <- list
+
+Figure_5_plots_stats <- lapply(list, function(x){
+  
+  tmp_plot_stats <- ggplot(data = log_stats[[x]], 
+                           aes(x = group1,
+                               y = pos_y)) +
+    
+    geom_segment(data = na.omit(log_stats[[x]]), 
+                 aes(x = group1, 
+                     xend = group2,
+                     y = pos_y, 
+                     yend = pos_y), 
+                 colour = "black", 
+                 linewidth = 1.25) +
+    
+    geom_text(data = log_stats[[x]],
+              label = log_stats[[x]]$adj.p.value,
+              x = log_stats[[x]]$pos_x,
+              y = log_stats[[x]]$pos_y,
+              size = 15,
+              colour = "black") +
+    
+    facet_wrap(~factor(Treatment, 
+                       levels = c('M0_Veh', 'M2_Veh', 
+                                  'M0_M1', 'M2_M1', 
+                                  'M0_PM', 'M2_PM',
+                                  'M0_M1+PM', 'M2_M1+PM')),
+               nrow = 1) +
+    
+    # Label x and y axis
+    labs(title = NULL,
+         x = NULL, 
+         y = paste0('Log2 Fold Change \n Vehicle ', x, ' Concentration'),
+         fill = 'Particle Month') + 
+    
+    theme(axis.text.x = element_text(angle = 60, 
+                                   hjust = 1, 
+                                   face="bold", 
+                                   size = 30),
+        
+        axis.text.y = element_text(face="bold", 
+                                   size = 26), 
+        
+        axis.title.x = element_text(face = 'bold', 
+                                    size = 30), 
+        
+        axis.title.y = element_text(face = 'bold', 
+                                    size = 32),
+          
+          strip.text.x = element_text(size = 32),
+        
+        plot.margin = unit(c(0, 0, 0, 0), "cm")) +
+    
+    scale_x_discrete(limits = c('December', 'March', 'June', 'September')) +
+    scale_y_continuous(limits = c(0, max(log_stats[[x]]$pos_y) + 0.25))
+})
+
+names(Figure_5_plots_stats) <- list
+
+log_plot_combined <- list()
+
+for(i in 1:length(list)){
+  
+  log_plot_combined[[i]] <- wrap_plots(Figure_5_plots_stats[[i]] +  
+                                         theme_void(),
+                                       Figure_5_plots[[i]] + 
+                                         theme(legend.position = "none"), 
+                                       ncol = 1,
+                                       heights = c(0.4, 2)) %>% 
+    ggdraw()
+  
+}
+```
+
+### M1 raw value statistics and graphing - Figure 5C-L
+
+```{r}
+list <- as.list(unique(as.character(contrib$name)))
+list2 <- as.list(unique(merge$Group))
+
+Raw_stats <- lapply(list, function(x){
+  
+  tmp <- merge %>% subset(Analyte == x) %>% 
+    arrange(Raw_Value) %>%    
+    mutate(Month = factor(Month, 
+                          levels = c('December', 'March', 'June', 'September')))
+  
+  tmp <- na.omit(tmp)
+  
+  tmp2 <- lapply(list2, function(y){
+    
+    tmp2 <- tmp %>% subset(Group == y)
+    
+    test <- tmp2 %>%
+      group_by(Month) %>% 
+      do(broom::tidy(shapiro.test(.$Raw_Value)))
+    
+    if(min(test$p.value) >= 0.05){
+      
+      stats <- rstatix::pairwise_t_test(Raw_Value ~ Month,
+                                        paired = FALSE, 
+                                        p.adjust.method = "BH", 
+                                        data = tmp2)
+      
+      stats$adj.p.value <- round(stats$p.adj, 3)
+      
+      # Convert adjusted p values to significance symbols
+      stats <- stats %>% mutate(adj.p.value = 
+                                  case_when((adj.p.value >= 0.05) ~ NA,
+                                            
+                                            (adj.p.value < 0.05 &
+                                               adj.p.value >= 0.01) ~ '*', 
+                                            
+                                            (adj.p.value < 0.01 &
+                                               adj.p.value >= 0.001) ~ '**',
+                                            
+                                            (adj.p.value < 0.001) ~ '***'))
+      
+      stats$test <- 't.test'
+      stats <- stats[, -c(7)] # Remove p.sigif to retain only adj.p.value
+      stats$Treatment <- y
+      stats
+      
+      } else{ # If treatment group does not have a normal distribution
+        
+        # Run a Wilcox test with BH correction
+        stats <- rstatix::pairwise_wilcox_test(Raw_Value ~ Month, 
+                                               paired = FALSE, 
+                                               p.adjust.method = "BH", 
+                                               data = tmp2)
+        
+        # Round resulting p-values to 3 digits
+        stats$adj.p.value <- round(stats$p.adj, 3)
+        
+        # Convert adjusted p values to significance symbols
+        stats <- stats %>% mutate(adj.p.value =
+                                    case_when((adj.p.value >= 0.05) ~ NA,
+                                              
+                                              (adj.p.value < 0.05 &
+                                                 adj.p.value >= 0.01) ~ '*',
+                                              
+                                              (adj.p.value < 0.01 &
+                                                 adj.p.value >= 0.001) ~ '**',
+                                              
+                                              (adj.p.value < 0.001) ~ '***'))
+        
+        stats$test <- 'Wilcox'
+        stats <- stats[, -c(6)] # Remove p.sigif to retain only adj.p.value
+        stats$Treatment <- y
+        stats
+        
+      }
+    
+    if(all(is.na(stats[, 'adj.p.value'])) == TRUE){
+      
+      stats$pos_x_1 <- 0
+      stats$pos_x_2 <- 0
+      stats$pos_x <- 0
+      stats$pos_y <- 0
+      stats
+      
+      } else{
+        
+        stats <- na.omit(stats)
+        
+        stats <- stats %>% mutate(pos_x_1 =
+                                    case_when((group1 == 'December') ~ 1,
+                                              (group1 == 'March') ~ 2,
+                                              (group1 == 'June') ~ 3,
+                                              (group1 == 'September') ~ 4))
+        
+        stats <- stats %>% mutate(pos_x_2 =
+                                    case_when((group2 == 'December') ~ 1,
+                                              (group2 == 'March') ~ 2,
+                                              (group2 == 'June') ~ 3,
+                                              (group2 == 'September') ~ 4))
+        
+        stats$pos_x <- (stats$pos_x_1 + stats$pos_x_2)/2
+        
+        stats$pos_y <- seq(from = 0.25,
+                           to = 0.25 * nrow(stats), 
+                           0.25)
+        
+        stats
+      }
+    
+    })
+  
+  # Combine the statistics into one place
+  tmp <- do.call(rbind, tmp2)
+  tmp
+  
+  })
+
+names(Raw_stats) <- list
+
+Figure_5_raw_plots <- lapply(list, function(x){
+  
+  tmp <- merge %>% 
+    subset(Analyte == x) %>% 
+    arrange(Raw_Value) %>%    
+    mutate(Month = factor(Month, 
+                          levels = c('December', 'March', 'June', 'September')))
+  
+  tmp <- na.omit(tmp)
+  
+  max <- max(tmp$Raw_Value) * 1.05
+  
+  pos <- c(max, max * 1.15, max * 1.3, max * 1.45, max * 1.6, max * 1.75)
+  
+  ggplot(data = tmp, 
+         aes(x = Month, 
+             y = Raw_Value, 
+             fill = Group)) +
+    
+    geom_bar(aes(col = Month),
+             fill = 'white',
+             position = position_dodge(),
+             stat = "summary",
+             fun = "mean",
+             show.legend = FALSE) +
+    
+    geom_point(aes(col = Month,
+                   shape = Sample),
+               stat = "identity",
+               position = position_dodge(width = .9),
+               alpha = .8,
+               size = 8,
+               show.legend = FALSE) +
+    
+    # Add SEM bars
+    stat_summary(geom = "errorbar",
+                 fun.data = mean_se,
+                 position = "dodge") +
+    
+    facet_wrap(~factor(Group, 
+                       levels = c('M0_Veh', 'M2_Veh', 
+                                  'M0_M1', 'M2_M1', 
+                                  'M0_PM', 'M2_PM',
+                                  'M0_M1+PM', 'M2_M1+PM')),
+               nrow = 1) +
+    
+    # Label x and y axis
+    labs(title = NULL,
+         x = NULL, 
+         y = paste0(x, " Concentration \n (pg/mL)"), 
+         fill = "Particle Month") + 
+    
+    theme(axis.text.x = element_text(angle = 60, 
+                                   hjust = 1, 
+                                   face="bold", 
+                                   size = 30),
+        
+        axis.text.y = element_text(face="bold", 
+                                   size = 26), 
+        
+        axis.title.x = element_text(face = 'bold', 
+                                    size = 30), 
+        
+        axis.title.y = element_text(face = 'bold', 
+                                    size = 32),
+          
+          strip.text.x = element_text(size = 32),
+        
+        plot.margin = unit(c(0, 0, 0, 0), "cm")) +
+    
+    scale_color_manual(name = 'Particle Month', 
+                       breaks = c('December', 'March', 'June', 'September'),
+                       values = c('December' = 'blue', 'March' = 'red', 
+                                  'June' = 'darkgreen', 'September' = 'purple')) +
+    
+    scale_shape_manual(values = shapes)
+  
+})
+
+names(Figure_5_raw_plots) <- list
+
+Figure_5_raw_plots_stats <- lapply(list, function(x){
+  
+  tmp_plot_stats <- ggplot(data = log_stats[[x]], 
+                           aes(x = group1,
+                               y = pos_y)) +
+    
+    geom_segment(data = na.omit(log_stats[[x]]), 
+                 aes(x = group1, 
+                     xend = group2,
+                     y = pos_y, 
+                     yend = pos_y), 
+                 colour = "black", 
+                 linewidth = 1.25) +
+    
+    geom_text(data = log_stats[[x]],
+              label = log_stats[[x]]$adj.p.value,
+              x = log_stats[[x]]$pos_x,
+              y = log_stats[[x]]$pos_y,
+              size = 15,
+              colour = "black") +
+    
+    facet_wrap(~factor(Treatment, 
+                       levels = c('M0_Veh', 'M2_Veh', 
+                                  'M0_M1', 'M2_M1', 
+                                  'M0_PM', 'M2_PM',
+                                  'M0_M1+PM', 'M2_M1+PM')),
+               nrow = 1) +
+    
+    # Label x and y axis
+    labs(title = NULL,
+         x = NULL, 
+         y = paste0(x, " Concentration \n (pg/mL)"), 
+         fill = 'Particle Month') + 
+    
+    theme(axis.text.x = element_text(angle = 60, 
+                                   hjust = 1, 
+                                   face="bold", 
+                                   size = 30),
+        
+        axis.text.y = element_text(face="bold", 
+                                   size = 26), 
+        
+        axis.title.x = element_text(face = 'bold', 
+                                    size = 30), 
+        
+        axis.title.y = element_text(face = 'bold', 
+                                    size = 32),
+          
+          strip.text.x = element_text(size = 32),
+        
+        plot.margin = unit(c(0, 0, 0, 0), "cm")) +
+    
+    scale_x_discrete(limits = c('December', 'March', 'June', 'September')) +
+    scale_y_continuous(limits = c(0, max(log_stats[[x]]$pos_y) + 0.25))
+})
+
+names(Figure_5_raw_plots_stats) <- list
+
+raw_plots_combined <- list()
+
+for(i in 1:length(list)){
+  
+  raw_plots_combined[[i]] <- wrap_plots(Figure_5_raw_plots_stats[[i]] +  
+                                          theme_void(),
+                                        Figure_5_raw_plots[[i]] + 
+                                          theme(legend.position = "none"), 
+                                        ncol = 1,
+                                        heights = c(0.4, 2)) %>% 
+    ggdraw()
+  
+}
+```
+
+### Combining M1 fold change and raw value graphs - Figure 5C-L
+
+```{r}
+for(i in 1:length(list)){
+  
+  tiff(paste0('Figure_5_', list[[i]], '.tiff'), width = 2000, height = 2000)
+  
+  print(
+  
+  wrap_plots(raw_plots_combined[[i]] + 
+               theme_void(),
+             log_plot_combined[[i]],
+             ncol = 1,
+             heights = c(1, 1)) %>% 
+    ggdraw())
+  
+  dev.off()
+}
+```
+
+### M0/M2 fold change PCA Figure 6A
+
+```{r}
+M0_M2_PCA <- FC %>% pivot_wider(names_from = 'Analyte', 
+                             values_from = 'Value') %>% 
+  subset(Group == 'M0_PM'|
+           Group == 'M2_PM')
+
+contrib <- fviz_contrib(prcomp(log(M0_M2_PCA[7:ncol(M0_M2_PCA)]), 
+                               center = TRUE, 
+                               scale = TRUE), 
+                        choice = "var", 
+                        axes = 1:2)
+
+contrib <- contrib$data %>% 
+  arrange(desc(contrib))
+
+contrib <- contrib[1:10, ]
+
+col <- c('forestgreen',
+         'orange3')
+
+shapes <- c(15, 16, 17, 18, 
+            0, 1, 2, 5, 
+            6, 8)
+
+# Set groups to factor with following order
+M0_M2_PCA$Group <- factor(M0_M2_PCA$Group,
+                       levels = c('M0_Veh', 'M2_Veh', 
+                               'M0_M0_M2', 'M2_M0_M2', 
+                               'M0_PM', 'M2_PM',
+                               'M0_M0_M2+PM', 'M2_M0_M2+PM'))
+                    
+# Set groups to factor with following order
+M0_M2_PCA$Month <- factor(M0_M2_PCA$Month, levels = c('December', 'March', 'June', 'September'))
+
+#############################
+
+fviz_pca_biplot(prcomp(log(M0_M2_PCA[7:ncol(M0_M2_PCA)]), center = TRUE, scale = TRUE),
+                label = "var", 
+                col.var = "grey50",
+                habillage = M0_M2_PCA$Group, 
+                palette = col,
+                addEllipses = TRUE, 
+                ellipse.type = 'confidence', 
+                repel = TRUE, 
+                ellipse.alpha = 0) + 
+  
+  ggtitle("PCA - Clustering") +
+  theme(axis.title = element_text(size = 14), 
+        axis.text = element_text(size = 12), 
+        plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+        panel.border = element_rect(fill = NA, color = "black", size = 0.3),
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_blank()) +
+  xlim(-10, 10) +
+  
+  # Add points for each group and color according to PM month
+  geom_point(aes(color = as.factor(M0_M2_PCA$Group),
+                 shape = as.factor(M0_M2_PCA$Group)),
+             size = 3, 
+             show.legend = FALSE) +
+  
+  # Manually set shapes to above indicated shapes
+  scale_shape_manual(values = shapes) 
+```
+
+### M0/M2 fold change heatmap Figure 6B
+
+```{r}
+Heatmap <- FC %>% pivot_wider(names_from = 'Analyte', 
+                              values_from = 'Value')
+
+info <- unique(Heatmap[1:6] %>% subset(Group == 'M0_PM' | 
+                                         Group == 'M2_PM')) %>% 
+  arrange(Month) %>%
+  mutate(Month = factor(Month, 
+                        levels = c('December',
+                                   'March',
+                                   'June',
+                                   'September')))
+
+FC_mean_heat <- Heatmap %>% subset(Group == 'M0_PM' | 
+                                     Group == 'M2_PM') %>% 
+  group_by(Month_Group) %>% 
+  summarize(across(everything(), mean))
+
+FC_mean_heat <- data.frame(FC_mean_heat[7:length(FC_mean_heat)], 
+                           row.names = FC_mean_heat$Month_Group)
+
+FC_mean_heat <- FC_mean_heat[c(1, 5, 3, 7, 
+                               2, 6, 4, 8), ]
+
+FC_mean_heat <- t(scale(FC_mean_heat))
+
+# Perform PAM clustering
+parallelpam::JWriteBin(as.matrix(FC_mean_heat),
+                       "MDM_mean.bin", 
+                       dtype = "float", 
+                       dmtype = "full")
+
+CalcAndWriteDissimilarityMatrix("MDM_mean.bin", 
+                                "MDM_mean2.bin",
+                                distype = "L2", 
+                                restype = "float",
+                                comment = "L2 distance for vectors in jmatrix file vst_mean.bin", 
+                                nthreads = 8)
+
+JMatInfo("MDM_mean2.bin")
+
+MDM_results_pam = ApplyPAM("MDM_mean2.bin", 
+                           k = 4,
+                           init_method = "BUILD", 
+                           max_iter = 1000, 
+                           nthreads = 8)
+
+Group <- factor(str_sub(colnames(FC_mean_heat), 
+                        -5, 
+                        nchar(colnames(FC_mean_heat))), 
+                levels = c('M0_PM',
+                           'M2_PM'))
+
+Month <- factor(str_sub(colnames(FC_mean_heat), 
+                        1, 
+                        -7), 
+                levels = c('December',
+                           'March',
+                           'June',
+                           'September'))
+
+# Create annotation data frame
+annotation <- data.frame(
+  Group = Group, 
+  Month = Month,
+  stringsAsFactors = FALSE)
+
+colors <- list(
+  Group = c('M0_PM' = 'forestgreen',
+            'M2_PM' = 'orange3'), 
+  
+  Month = c('December' = 'blue',
+            'March' = 'red',
+            'June' = 'green',
+            'September' = 'purple'))
+
+colAnn <- HeatmapAnnotation(
+  df = annotation,
+  name = ' ',
+  which = 'col', # 'col' (samples) or 'row' (gene) annotation?
+  col = colors,
+  annotation_height = 0.6,
+  annotation_width = unit(1, 'cm'),
+  gap = unit(1, 'mm'),
+  show_legend = TRUE)
+
+hmap3 <- Heatmap(FC_mean_heat,
+                 
+                 # split the genes / rows according to the PAM clusters
+                 row_split = MDM_results_pam$clasif,
+                 column_split = Group,
+                 cluster_row_slices = FALSE,
+                 gap = unit(2.5, "mm"),
+                 column_gap = unit(2.5, 'mm'),
+                 border = TRUE,
+                 height = ncol(FC_mean_heat) * unit(20, 'mm'),
+                 width = ncol(FC_mean_heat) * unit(15, 'mm'),
+                 
+                 name = 'Z-Score',
+
+                # Add value of each cell to the heatmap
+                # Change the text color depending on the value of the cell
+                cell_fun = function(j, i, x, y, width, height, fill) {
+                  grid.text(sprintf("%.1f", t(FC_mean_heat)[j, i]), x, y, gp = gpar(fontsize = 9, 
+                                                                         col = 'black',
+                                                                         fontface = 'bold'))},
+                
+                 col = myCol,
+                 
+                 # parameters for the color-bar that represents gradient of expression
+                 heatmap_legend_param = list(
+                   color_bar = 'continuous',
+                   legend_direction = 'horizontal',
+                   at = c(-3, -1.5, 0, 1.5, 3),
+                   legend_width = unit(8, 'cm'),
+                   legend_height = unit(5.0, 'cm'),
+                   title_position = 'topcenter',
+                   title_gp=gpar(fontsize = 12, fontface = 'bold'),
+                   labels_gp=gpar(fontsize = 12, fontface = 'bold')),
+                 
+                 # row (gene) parameters
+                 cluster_rows = TRUE,
+                 show_row_dend = TRUE,
+                 row_title_side = 'left',
+                 row_title_gp = gpar(fontsize = 0,  fontface = 'bold'),
+                 row_title_rot = 0,
+                 show_row_names = TRUE,
+                 row_names_gp = gpar(fontsize = 9, fontface = 'bold'),
+                 row_names_side = 'left',
+                 row_dend_width = unit(25,'mm'),
+                 
+                 # column (sample) parameters
+                 cluster_columns = FALSE,
+                 show_column_dend = FALSE,
+                 column_title = '',
+                 column_title_side = 'bottom',
+                 column_title_gp = gpar(fontsize = 10, fontface = 'bold'),
+                 show_column_names = FALSE,
+                 column_names_gp = gpar(fontsize = 10, fontface = 'bold'),
+                 column_names_max_height = unit(10, 'cm'),
+                 column_dend_height = unit(25,'mm'),
+                 
+                 # cluster methods for rows and columns
+                 clustering_distance_columns = function(x) as.dist(1 - cor(t(x))),
+                 clustering_method_columns = 'ward.D2',
+                 clustering_distance_rows = function(x) as.dist(1 - cor(t(x))),
+                 clustering_method_rows = 'ward.D2',
+                 
+                 # # specify top and bottom annotations
+                 top_annotation = colAnn)
+
+png(file = "M0_M2_Groups_Mean_Heatmap.png", height = 800, width = 1000)
+
+draw(hmap3,
+     heatmap_legend_side = 'top')
+
+dev.off()
+```
+
+### M0/M2 fold change statistics and graphing - Figure 6C-L
+
+```{r}
+merge <- merge(FC, MSD)
+
+merge <- merge %>% subset(Group == 'M0_PM' |
+                            Group == 'M2_PM')
+
+merge$Value <- log2(merge$Value)
+
+merge$Group <- factor(merge$Group, 
+                      levels = c('M0_Veh', 'M2_Veh', 
+                                 'M0_M1', 'M2_M1', 
+                                 'M0_PM', 'M2_PM',
+                                 'M0_M1+PM', 'M2_M1+PM'))
+                   
+merge$Month <- factor(merge$Month, 
+                      levels = c('December', 'March', 'June', 'September'))
+
+list <- as.list(unique(as.character(contrib$name)))
+list2 <- as.list(unique(merge$Group))
+
+log_stats <- lapply(list, function(x){
+  
+  tmp <- merge %>% subset(Analyte == x) %>% 
+    arrange(Value) %>%    
+    mutate(Month = factor(Month, 
+                          levels = c('December', 'March', 'June', 'September')))
+  
+  tmp <- na.omit(tmp)
+  
+  tmp2 <- lapply(list2, function(y){
+    
+    tmp2 <- tmp %>% subset(Group == y)
+    
+    # TNF.b samples are all 0, and therefore cannot be tested for normality
+    # Other months have non-normally distributed data (not shown), so Wilcox test
+    # should be employed. Here, all other analytes are tested for normality and TNF.b
+    # is directly tested with the Wilcox test
+    if(x != 'TNF.β'){
+      
+      test <- tmp2 %>%
+        group_by(Month) %>% 
+        do(broom::tidy(shapiro.test(.$Value)))
+      
+      if(min(test$p.value) >= 0.05){
+        
+        stats <- rstatix::pairwise_t_test(Value ~ Month, 
+                                          paired = FALSE,
+                                          p.adjust.method = "BH", 
+                                          data = tmp2)
+        
+        stats$adj.p.value <- round(stats$p.adj, 3)
+        
+        # Convert adjusted p values to significance symbols
+        stats <- stats %>% mutate(adj.p.value = 
+                                    case_when((adj.p.value >= 0.05) ~ NA,
+                                              
+                                              (adj.p.value < 0.05 &
+                                                 adj.p.value >= 0.01) ~ '*', 
+                                              
+                                              (adj.p.value < 0.01 &
+                                                 adj.p.value >= 0.001) ~ '**',
+                                              
+                                              (adj.p.value < 0.001) ~ '***'))
+        
+        stats$test <- 't.test'
+        stats <- stats[, -c(7)] # Remove p.sigif to retain only adj.p.value
+        stats$Treatment <- y
+        stats
+        
+        } else{ # If treatment group does not have a normal distribution
+          
+          # Run a Wilcox test with BH correction
+          stats <- rstatix::pairwise_wilcox_test(Value ~ Month, 
+                                                 paired = FALSE,
+                                                 p.adjust.method = "BH",
+                                                 data = tmp2)
+          
+          # Round resulting p-values to 3 digits
+          stats$adj.p.value <- round(stats$p.adj, 3)
+          
+          # Convert adjusted p values to significance symbols
+          stats <- stats %>% mutate(adj.p.value =
+                                      case_when((adj.p.value >= 0.05) ~ NA,
+                                                
+                                                (adj.p.value < 0.05 &
+                                                   adj.p.value >= 0.01) ~ '*',
+                                                
+                                                (adj.p.value < 0.01 &
+                                                   adj.p.value >= 0.001) ~ '**',
+                                                
+                                                (adj.p.value < 0.001) ~ '***'))
+          
+          stats$test <- 'Wilcox'
+          stats <- stats[, -c(6)] # Remove p.sigif to retain only adj.p.value
+          stats$Treatment <- y
+          stats
+          
+        }
+      } else{ 
+        
+        stats <- rstatix::pairwise_wilcox_test(Value ~ Month, 
+                                               paired = FALSE, 
+                                               p.adjust.method = "BH", 
+                                               data = tmp2)
+      
+        stats$adj.p.value <- round(stats$p.adj, 3)
+        
+        stats <- stats %>% mutate(adj.p.value =
+                                    case_when((adj.p.value >= 0.05) ~ NA,
+                                              
+                                              (adj.p.value < 0.05 &
+                                                 adj.p.value >= 0.01) ~ '*',
+                                              
+                                              (adj.p.value < 0.01 &
+                                                 adj.p.value >= 0.001) ~ '**',
+                                              (adj.p.value < 0.001) ~ '***'))
+        
+        stats$Group <- y
+        stats$test <- 'Wilcox'
+        stats <- stats[, -c(6)]
+        stats$Treatment <- y
+        stats
+        }
+    
+    if(all(is.na(stats[, 'adj.p.value'])) == TRUE){
+      
+      stats$pos_x_1 <- 0
+      stats$pos_x_2 <- 0
+      stats$pos_x <- 0
+      stats$pos_y <- 0
+      stats
+      
+      } else{
+        
+        stats <- na.omit(stats)
+
+        stats <- stats %>% mutate(pos_x_1 =
+                                    case_when((group1 == 'December') ~ 1,
+                                              (group1 == 'March') ~ 2,
+                                              (group1 == 'June') ~ 3,
+                                              (group1 == 'September') ~ 4))
+        
+        stats <- stats %>% mutate(pos_x_2 =
+                                    case_when((group2 == 'December') ~ 1,
+                                              (group2 == 'March') ~ 2,
+                                              (group2 == 'June') ~ 3,
+                                              (group2 == 'September') ~ 4))
+        
+        stats$pos_x <- (stats$pos_x_1 + stats$pos_x_2)/2
+        
+        stats$pos_y <- seq(from = 0.25,
+                           to = 0.25 * nrow(stats), 
+                           0.25)
+        
+        stats
+        
+        }
+    })
+                
+  tmp <- do.call(rbind, tmp2)
+
+})
+
+names(log_stats) <- list
+
+shapes <- rep(c(15:18, 11), 8)
+
+Figure_6_plots <- lapply(list, function(x){
+  
+  tmp <- merge %>% 
+    subset(Analyte == x) %>% 
+    arrange(Value) %>%    
+    mutate(Month = factor(Month, 
+                          levels = c('December', 'March', 'June', 'September')))
+  
+  tmp <- na.omit(tmp)
+  
+  max <- max(tmp$Value) * 1.05
+  
+  pos <- c(max, max * 1.15, max * 1.3, max * 1.45, max * 1.6, max * 1.75)
+  
+  ggplot(data = tmp, 
+         aes(x = Month, 
+             y = Value, 
+             fill = Group)) +
+    
+    geom_bar(aes(col = Month),
+             fill = 'white',
+             position = position_dodge(),
+             stat = "summary",
+             fun = "mean",
+             show.legend = FALSE) +
+    
+    geom_point(aes(col = Month,
+                   shape = Sample),
+               stat = "identity",
+               position = position_dodge(width = .9),
+               alpha = .8,
+               size = 8,
+               show.legend = FALSE) +
+    
+    # Add SEM bars
+    stat_summary(geom = "errorbar",
+                 fun.data = mean_se,
+                 position = "dodge") +
+    
+    facet_wrap(~factor(Group, 
+                       levels = c('M0_Veh', 'M2_Veh', 
+                                  'M0_M1', 'M2_M1', 
+                                  'M0_PM', 'M2_PM',
+                                  'M0_M1+PM', 'M2_M1+PM')),
+               nrow = 1) +
+    
+    # Label x and y axis
+    labs(title = NULL,
+         x = NULL, 
+         y = paste0('Log2 Fold Change \n Vehicle ', x, ' Concentration'),
+         fill = 'Particle Month') + 
+    
+    theme(axis.text.x = element_text(angle = 60, 
+                                   hjust = 1, 
+                                   face="bold", 
+                                   size = 30),
+        
+        axis.text.y = element_text(face="bold", 
+                                   size = 26), 
+        
+        axis.title.x = element_text(face = 'bold', 
+                                    size = 30), 
+        
+        axis.title.y = element_text(face = 'bold', 
+                                    size = 32),
+          
+          strip.text.x = element_text(size = 32),
+        
+        plot.margin = unit(c(0, 0, 0, 0), "cm")) +
+    
+    scale_color_manual(name = 'Particle Month', 
+                       breaks = c('December', 'March', 'June', 'September'),
+                       values = c('December' = 'blue', 'March' = 'red', 
+                                  'June' = 'darkgreen', 'September' = 'purple')) +
+    
+    scale_shape_manual(values = shapes)
+  
+})
+
+names(Figure_6_plots) <- list
+
+Figure_6_plots_stats <- lapply(list, function(x){
+  
+  tmp_plot_stats <- ggplot(data = log_stats[[x]], 
+                           aes(x = group1,
+                               y = pos_y)) +
+    
+    geom_segment(data = na.omit(log_stats[[x]]), 
+                 aes(x = group1, 
+                     xend = group2,
+                     y = pos_y, 
+                     yend = pos_y), 
+                 colour = "black", 
+                 linewidth = 1.25) +
+    
+    geom_text(data = log_stats[[x]],
+              label = log_stats[[x]]$adj.p.value,
+              x = log_stats[[x]]$pos_x,
+              y = log_stats[[x]]$pos_y,
+              size = 15,
+              colour = "black") +
+    
+    facet_wrap(~factor(Treatment, 
+                       levels = c('M0_Veh', 'M2_Veh', 
+                                  'M0_M1', 'M2_M1', 
+                                  'M0_PM', 'M2_PM',
+                                  'M0_M1+PM', 'M2_M1+PM')),
+               nrow = 1) +
+    
+    # Label x and y axis
+    labs(title = NULL,
+         x = NULL,
+         y = paste0('Log2 Fold Change \n Vehicle ', x, ' Concentration'),
+         fill = 'Particle Month') + 
+    
+    theme(axis.text.x = element_text(angle = 60, 
+                                   hjust = 1, 
+                                   face="bold", 
+                                   size = 30),
+        
+        axis.text.y = element_text(face="bold", 
+                                   size = 26), 
+        
+        axis.title.x = element_text(face = 'bold', 
+                                    size = 30), 
+        
+        axis.title.y = element_text(face = 'bold', 
+                                    size = 32),
+          
+          strip.text.x = element_text(size = 32),
+        
+        plot.margin = unit(c(0, 0, 0, 0), "cm")) +
+    
+    scale_x_discrete(limits = c('December', 'March', 'June', 'September')) +
+    scale_y_continuous(limits = c(0, max(log_stats[[x]]$pos_y) + 0.25))
+})
+
+names(Figure_6_plots_stats) <- list
+
+log_plot_combined <- list()
+
+for(i in 1:length(list)){
+  
+  log_plot_combined[[i]] <- wrap_plots(Figure_6_plots_stats[[i]] +  
+                                         theme_void(),
+                                       Figure_6_plots[[i]] + 
+                                         theme(legend.position = "none"), 
+                                       ncol = 1,
+                                       heights = c(0.4, 2)) %>% 
+    ggdraw()
+  
+}
+```
+
+### M0/M2 raw value statistics and graphing - Figure 6C-L
+
+```{r}
+list <- as.list(unique(as.character(contrib$name)))
+list2 <- as.list(unique(merge$Group))
+
+Raw_stats <- lapply(list, function(x){
+  
+  tmp <- merge %>% subset(Analyte == x) %>% 
+    arrange(Raw_Value) %>%    
+    mutate(Month = factor(Month, 
+                          levels = c('December', 'March', 'June', 'September')))
+  
+  tmp <- na.omit(tmp)
+  
+  tmp2 <- lapply(list2, function(y){
+    
+    tmp2 <- tmp %>% subset(Group == y)
+    
+    # TNF.b samples are all 0, and therefore cannot be tested for normality
+    # Other months have non-normally distributed data (not shown), so Wilcox test
+    # should be employed. Here, all other analytes are tested for normality and TNF.b
+    # is directly tested with the Wilcox test
+    if(x != 'TNF.β'){
+      
+      test <- tmp2 %>%
+        group_by(Month) %>% 
+        do(broom::tidy(shapiro.test(.$Raw_Value)))
+      
+      if(min(test$p.value) >= 0.05){
+        
+        stats <- rstatix::pairwise_t_test(Raw_Value ~ Month, 
+                                          paired = FALSE,
+                                          p.adjust.method = "BH", 
+                                          data = tmp2)
+        
+        stats$adj.p.value <- round(stats$p.adj, 3)
+        
+        # Convert adjusted p values to significance symbols
+        stats <- stats %>% mutate(adj.p.value = 
+                                    case_when((adj.p.value >= 0.05) ~ NA,
+                                              
+                                              (adj.p.value < 0.05 &
+                                                 adj.p.value >= 0.01) ~ '*', 
+                                              
+                                              (adj.p.value < 0.01 &
+                                                 adj.p.value >= 0.001) ~ '**',
+                                              
+                                              (adj.p.value < 0.001) ~ '***'))
+        
+        stats$test <- 't.test'
+        stats <- stats[, -c(7)] # Remove p.sigif to retain only adj.p.value
+        stats$Treatment <- y
+        stats
+        
+        } else{ # If treatment group does not have a normal distribution
+          
+          # Run a Wilcox test with BH correction
+          stats <- rstatix::pairwise_wilcox_test(Raw_Value ~ Month, 
+                                                 paired = FALSE,
+                                                 p.adjust.method = "BH",
+                                                 data = tmp2)
+          
+          # Round resulting p-values to 3 digits
+          stats$adj.p.value <- round(stats$p.adj, 3)
+          
+          # Convert adjusted p values to significance symbols
+          stats <- stats %>% mutate(adj.p.value =
+                                      case_when((adj.p.value >= 0.05) ~ NA,
+                                                
+                                                (adj.p.value < 0.05 &
+                                                   adj.p.value >= 0.01) ~ '*',
+                                                
+                                                (adj.p.value < 0.01 &
+                                                   adj.p.value >= 0.001) ~ '**',
+                                                
+                                                (adj.p.value < 0.001) ~ '***'))
+          
+          stats$test <- 'Wilcox'
+          stats <- stats[, -c(6)] # Remove p.sigif to retain only adj.p.value
+          stats$Treatment <- y
+          stats
+          
+        }
+      } else{ 
+        
+        stats <- rstatix::pairwise_wilcox_test(Raw_Value ~ Month, 
+                                               paired = FALSE, 
+                                               p.adjust.method = "BH", 
+                                               data = tmp2)
+      
+        stats$adj.p.value <- round(stats$p.adj, 3)
+        
+        stats <- stats %>% mutate(adj.p.value =
+                                    case_when((adj.p.value >= 0.05) ~ NA,
+                                              
+                                              (adj.p.value < 0.05 &
+                                                 adj.p.value >= 0.01) ~ '*',
+                                              
+                                              (adj.p.value < 0.01 &
+                                                 adj.p.value >= 0.001) ~ '**',
+                                              (adj.p.value < 0.001) ~ '***'))
+        
+        stats$Group <- y
+        stats$test <- 'Wilcox'
+        stats <- stats[, -c(6)]
+        stats$Treatment <- y
+        stats
+        }
+    
+    if(all(is.na(stats[, 'adj.p.value'])) == TRUE){
+      
+      stats$pos_x_1 <- 0
+      stats$pos_x_2 <- 0
+      stats$pos_x <- 0
+      stats$pos_y <- 0
+      stats
+      
+      } else{
+        
+        stats <- na.omit(stats)
+        
+        stats <- stats %>% mutate(pos_x_1 =
+                                    case_when((group1 == 'December') ~ 1,
+                                              (group1 == 'March') ~ 2,
+                                              (group1 == 'June') ~ 3,
+                                              (group1 == 'September') ~ 4))
+        
+        stats <- stats %>% mutate(pos_x_2 =
+                                    case_when((group2 == 'December') ~ 1,
+                                              (group2 == 'March') ~ 2,
+                                              (group2 == 'June') ~ 3,
+                                              (group2 == 'September') ~ 4))
+        
+        stats$pos_x <- (stats$pos_x_1 + stats$pos_x_2)/2
+        
+        stats$pos_y <- seq(from = 0.25,
+                           to = 0.25 * nrow(stats), 
+                           0.25)
+        
+        stats
+        
+        }
+    })
+                
+  tmp <- do.call(rbind, tmp2)
+
+})
+
+names(Raw_stats) <- list
+
+Figure_6_raw_plots <- lapply(list, function(x){
+  
+  tmp <- merge %>% 
+    subset(Analyte == x) %>% 
+    arrange(Raw_Value) %>%    
+    mutate(Month = factor(Month, 
+                          levels = c('December', 'March', 'June', 'September')))
+  
+  tmp <- na.omit(tmp)
+  
+  max <- max(tmp$Raw_Value) * 1.05
+  
+  pos <- c(max, max * 1.15, max * 1.3, max * 1.45, max * 1.6, max * 1.75)
+  
+  ggplot(data = tmp, 
+         aes(x = Month, 
+             y = Raw_Value, 
+             fill = Group)) +
+    
+    geom_bar(aes(col = Month),
+             fill = 'white',
+             position = position_dodge(),
+             stat = "summary",
+             fun = "mean",
+             show.legend = FALSE) +
+    
+    geom_point(aes(col = Month,
+                   shape = Sample),
+               stat = "identity",
+               position = position_dodge(width = .9),
+               alpha = .8,
+               size = 8,
+               show.legend = FALSE) +
+    
+    # Add SEM bars
+    stat_summary(geom = "errorbar",
+                 fun.data = mean_se,
+                 position = "dodge") +
+    
+    facet_wrap(~factor(Group, 
+                       levels = c('M0_Veh', 'M2_Veh', 
+                                  'M0_M1', 'M2_M1', 
+                                  'M0_PM', 'M2_PM',
+                                  'M0_M1+PM', 'M2_M1+PM')),
+               nrow = 1) +
+    
+    # Label x and y axis
+    labs(title = NULL,
+         x = NULL, 
+         y = paste0(x, " Concentration \n (pg/mL)"), 
+         fill = "Particle Month") + 
+    
+    theme(axis.text.x = element_text(angle = 60, 
+                                   hjust = 1, 
+                                   face="bold", 
+                                   size = 30),
+        
+        axis.text.y = element_text(face="bold", 
+                                   size = 26), 
+        
+        axis.title.x = element_text(face = 'bold', 
+                                    size = 30), 
+        
+        axis.title.y = element_text(face = 'bold', 
+                                    size = 32),
+          
+          strip.text.x = element_text(size = 32),
+        
+        plot.margin = unit(c(0, 0, 0, 0), "cm")) +
+    
+    scale_color_manual(name = 'Particle Month', 
+                       breaks = c('December', 'March', 'June', 'September'),
+                       values = c('December' = 'blue', 'March' = 'red', 
+                                  'June' = 'darkgreen', 'September' = 'purple')) +
+    
+    scale_shape_manual(values = shapes)
+  
+})
+
+names(Figure_6_raw_plots) <- list
+
+Figure_6_raw_plots_stats <- lapply(list, function(x){
+  
+  tmp_plot_stats <- ggplot(data = log_stats[[x]], 
+                           aes(x = group1,
+                               y = pos_y)) +
+    
+    geom_segment(data = na.omit(log_stats[[x]]), 
+                 aes(x = group1, 
+                     xend = group2,
+                     y = pos_y, 
+                     yend = pos_y), 
+                 colour = "black", 
+                 linewidth = 1.25) +
+    
+    geom_text(data = log_stats[[x]],
+              label = log_stats[[x]]$adj.p.value,
+              x = log_stats[[x]]$pos_x,
+              y = log_stats[[x]]$pos_y,
+              size = 15,
+              colour = "black") +
+    
+    facet_wrap(~factor(Treatment, 
+                       levels = c('M0_Veh', 'M2_Veh', 
+                                  'M0_M1', 'M2_M1', 
+                                  'M0_PM', 'M2_PM',
+                                  'M0_M1+PM', 'M2_M1+PM')),
+               nrow = 1) +
+    
+    # Label x and y axis
+    labs(title = NULL,
+         x = NULL, 
+         y = paste0(x, " Concentration \n (pg/mL)"), 
+         fill = 'Particle Month') + 
+    
+    theme(axis.text.x = element_text(angle = 60, 
+                                   hjust = 1, 
+                                   face="bold", 
+                                   size = 30),
+        
+        axis.text.y = element_text(face="bold", 
+                                   size = 26), 
+        
+        axis.title.x = element_text(face = 'bold', 
+                                    size = 30), 
+        
+        axis.title.y = element_text(face = 'bold', 
+                                    size = 32),
+          
+          strip.text.x = element_text(size = 32),
+        
+        plot.margin = unit(c(0, 0, 0, 0), "cm")) +
+    
+    scale_x_discrete(limits = c('December', 'March', 'June', 'September')) +
+    scale_y_continuous(limits = c(0, max(log_stats[[x]]$pos_y) + 0.25))
+})
+
+names(Figure_6_raw_plots_stats) <- list
+
+raw_plots_combined <- list()
+
+for(i in 1:length(list)){
+  
+  raw_plots_combined[[i]] <- wrap_plots(Figure_6_raw_plots_stats[[i]] +  
+                                          theme_void(),
+                                        Figure_6_raw_plots[[i]] + 
+                                          theme(legend.position = "none"), 
+                                        ncol = 1,
+                                        heights = c(0.4, 2)) %>% 
+    ggdraw()
+  
+}
+```
+
+### Combining M2 fold change and raw value graphs - Figure 6C-L
+
+```{r}
+for(i in 1:length(list)){
+  
+  tiff(paste0('Figure_6_', list[[i]], '.tiff'), width = 2000, height = 2000)
+  
+  print(
+  
+  wrap_plots(raw_plots_combined[[i]] + 
+               theme_void(),
+             log_plot_combined[[i]],
+             ncol = 1,
+             heights = c(1, 1)) %>% 
+    ggdraw())
+  
+  dev.off()
+}
+```

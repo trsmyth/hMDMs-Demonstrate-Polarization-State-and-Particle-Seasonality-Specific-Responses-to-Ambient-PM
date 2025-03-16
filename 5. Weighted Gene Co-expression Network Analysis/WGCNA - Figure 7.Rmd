@@ -1,0 +1,395 @@
+---
+title: "WGCNA"
+author: "Timothy Smyth"
+date: "2024-04-15"
+output: html_document
+---
+
+# Perform weighted gene co-expression network analysis (WGCNA) of MSD data
+
+### Load packages
+
+```{r message = FALSE}
+rm(list = ls(all.names = TRUE)) # clears global environ.
+
+# Load packages
+library(tidyverse) # for data cleaning
+library(WGCNA)        
+library(RColorBrewer)
+library(flashClust)
+library(formattable)
+```
+
+### Import and format data
+
+```{r}
+# Import data
+MSD <- read.csv("MSD.csv")
+
+colnames(MSD) <- c('Sample', 'Assay', 'Well', 'Spot', 
+                   'Dilution', 'Concentration', 'Signal', 'Adjusted_signal', 
+                   'Mean', 'Adj_signal_mean', 'CV', 'Percent_recovery', 
+                   'Percent_Recovery_mean', 'Calc_conc', 'Calc_conc_mean', 'Calc_conc_CV')
+
+# Remove Pro-inflammatory panel IL-8 as Chemokine IL-8 has much higher max concentration
+MSD <- MSD %>% filter(Assay != "IL-8" | Spot != '6')
+
+MSD$Month <- 'NA'
+
+MSD <- MSD %>% dplyr::select(Month, everything())
+
+# Remove unneeded variables
+MSD <- MSD %>% subset(select = -c(Well, Spot, Dilution, Concentration, 
+                                  Adjusted_signal, Mean, Signal, Adj_signal_mean, CV, 
+                                  Percent_recovery, Percent_Recovery_mean, Calc_conc_mean, Calc_conc_CV))
+
+# 289 and 290 shared between two PM groups. Those are already marked 
+# with their month, so it is used below instead of the number
+MSD <- MSD %>% mutate(Month =
+                        case_when(str_detect(Sample, '191') |
+                                    str_detect(Sample, '303') |  
+                                    str_detect(Sample, 'Mar') |
+                                    str_detect(Sample, '291') |
+                                    str_detect(Sample, '132') ~ 'March', 
+                                  
+                                  str_detect(Sample, 'Jun') | 
+                                    str_detect(Sample, '273') |
+                                    str_detect(Sample, '280') |
+                                    str_detect(Sample, '292') |
+                                    str_detect(Sample, '288') ~ 'June', 
+                                  
+                                  str_detect(Sample, '312') |
+                                    str_detect(Sample, '379') |
+                                    str_detect(Sample, 'Sept') |
+                                    str_detect(Sample, '308') |
+                                    str_detect(Sample, '310') ~ 'September', 
+                                  
+                                  str_detect(Sample, 'Dec') |
+                                    str_detect(Sample, '375') |
+                                    str_detect(Sample, '285') |
+                                    str_detect(Sample, '314') |
+                                    str_detect(Sample, '388') ~ 'December'))
+
+MSD$Group <- 'NA'
+MSD <- MSD %>% dplyr::select(Group, everything())
+
+# Rename groups
+MSD <- MSD %>% mutate(Group = 
+                        case_when(str_detect(Sample, 'M0_Veh') ~ 'M0_Veh', 
+                                  str_detect(Sample, 'M2_Veh') ~ 'M2_Veh',
+                                  
+                                  str_detect(Sample, 'M0_M1') & str_detect(Sample, '\\+') ~ 'M0_M1+PM',
+                                  str_detect(Sample, 'M2_M1') & str_detect(Sample, '\\+') ~ 'M2_M1+PM',
+                                  
+                                  str_detect(Sample, 'M0_M1') ~ 'M0_M1',
+                                  str_detect(Sample, 'M2_M1') ~ 'M2_M1',
+                                  
+                                  str_detect(Sample, 'M0_PM') ~ 'M0_PM',
+                                  str_detect(Sample, 'M2_PM') ~ 'M2_PM'))
+
+MSD$Treatment <- 'NA'
+MSD <- MSD %>% dplyr::select(Treatment, everything())
+
+MSD <- MSD %>% mutate(Treatment = 
+                        case_when(str_detect(Sample, 'Veh') ~ 'Veh', 
+                                  str_detect(Sample, 'M1') & str_detect(Sample, '\\+') ~ 'M1+PM',
+                                  str_detect(Sample, 'M1') ~ 'M1',
+                                  str_detect(Sample, 'PM') ~ 'PM',
+                        ))
+
+MSD$Starting <- 'NA'
+MSD <- MSD %>% dplyr::select(Starting, everything())
+
+# Mark sample as starting as M0 or M2
+MSD <- MSD %>% mutate(Starting = 
+                        case_when(str_detect(Sample, 'M0') ~ 'M0', 
+                                  str_detect(Sample, 'M2') ~ 'M2'))
+
+# Set row names to sample and assay to prepare for pivot
+MSD <- data.frame(MSD, row.names = paste0(MSD$Sample, "_", MSD$Assay))
+
+# Pivot wider so each column is an analyte
+MSD <- pivot_wider(MSD, names_from = Assay, values_from = Calc_conc)
+
+# Set to data frame with row names as sample ID
+MSD <- data.frame(MSD, row.names = MSD$Sample)
+
+# Set up Month and Group column to ID experimental clustering below
+MSD$Month_Group <- paste0(MSD$Month, "_", MSD$Group)
+MSD <- MSD %>% dplyr::select(Month_Group, everything())
+
+# Remove IFN-y and IL-4 due to presence in polarization/treatment media
+MSD <- MSD %>% subset(select = -c(IFN.γ, IL.4))
+
+# Remove IP-10 and MCP-4 since so many were above LOD
+MSD <- MSD %>% subset(select = -c(IP.10, MCP.4))
+
+MSD$Month <- factor(MSD$Month, 
+                    levels = c('March', 
+                               'June', 
+                               'September', 
+                               'December'))
+```
+
+### Group fold changes
+
+```{r}
+# Break up everything into their subgroups
+M0 <- MSD %>% subset(Group == 'M0_Veh' | Group == 'M0_PM')
+M1 <- MSD %>% subset(Group == 'M0_M1' | Group == 'M0_M1+PM')
+M2 <- MSD %>% subset(Group == 'M2_Veh' | Group == 'M2_PM')
+M2_M1 <- MSD %>% subset(Group == 'M2_M1' | Group == 'M2_M1+PM')
+
+# Compile into list for lapply
+FC <- list(M0, M1, M2, M2_M1)
+
+# Calculate the fold change of each treatment versus its related vehicle group
+FC <- lapply(FC, function(x){
+  
+  # Vehicles are Veh or _M1
+  # PM treatments are PM or M1+PM
+  tmp1 <- x %>% subset(Treatment == 'Veh' | Treatment == 'M1') %>% subset(select = -c(1:6))
+  tmp2 <- x %>% subset(Treatment == 'PM' | Treatment == 'M1+PM')
+  info <- tmp2[1:6]
+  tmp2 <- tmp2 %>% subset(select = -c(1:6))
+  
+  tmp3 <- tmp2/tmp1
+  
+  tmp3 <- cbind(info, tmp3)
+  
+})
+
+FC <- do.call(rbind, FC)
+
+FC <- FC %>% mutate(Month_Group = factor(Month_Group, 
+                                         levels = paste(rep(c('December', 
+                                                              'March', 
+                                                              'June', 
+                                                              'September'), 
+                                                            each = 4), 
+                                                        c('M0_PM', 
+                                                          'M0_M1+PM', 
+                                                          'M2_PM', 
+                                                          'M2_M1+PM'), 
+                                                        sep = "_"))) %>% arrange(Month_Group)
+```
+
+### Determine optimal soft threshold for WGCNA
+
+```{r}
+Data <- FC[7:ncol(FC)]
+
+powers = c(c(1:10), 
+           seq(from = 10, 
+               to = 30, 
+               by = 1))
+
+# Determine soft threshold
+sft = pickSoftThreshold(Data, 
+                        powerVector = powers, 
+                        verbose = 5, 
+                        networkType = "signed")
+  
+# Plot results
+sizeGrWindow(9, 5)
+par(mfrow = c(1, 2))
+cex1 = 0.9
+
+plot(sft$fitIndices[, 1], 
+     -sign(sft$fitIndices[, 3])*sft$fitIndices[, 2], 
+     xlab = "Soft Threshold (power)", 
+     ylab ="Scale Free Topology Model Fit, signed R^2", 
+     type = "n", 
+     main = paste("Scale independence"))
+
+text(sft$fitIndices[, 1], 
+     -sign(sft$fitIndices[, 3])*sft$fitIndices[, 2], 
+     labels = powers, 
+     cex = cex1, 
+     col = "red")
+
+abline(h = 0.5, 
+       col = "red")
+
+plot(sft$fitIndices[, 1], 
+     sft$fitIndices[, 5], 
+     xlab = "Soft Threshold (power)", 
+     ylab ="Mean Connectivity", 
+     type ="n", 
+     main = paste("Mean connectivity"))
+
+text(sft$fitIndices[, 1], 
+     sft$fitIndices[, 5], 
+     labels = powers, 
+     cex = cex1, 
+     col = "red")
+```
+
+### Perform automatic network construction and module detection
+
+```{r}
+net = blockwiseModules(Data, 
+                       power = 12,
+                       TOMType = "unsigned", 
+                       minModuleSize = 2,
+                       reassignThreshold = 0, 
+                       mergeCutHeight = 0.25,
+                       numericLabels = TRUE, 
+                       pamRespectsDendro = FALSE,
+                       saveTOMs = TRUE,
+                       saveTOMFileBase = "nasalTOM", 
+                       verbose = 3)
+
+table(net$colors)
+```
+
+### Generate heatmaps for Figure 7A/B
+
+```{r}
+# Convert labels to colors for plotting
+mergedColors = labels2colors(net$colors, 
+                             zeroIsGrey = TRUE,
+                             colorSeq = c("steelblue", "darkgreen", "maroon"))
+
+# Plot the dendrogram and the module colors underneath
+plotDendroAndColors(net$dendrograms[[1]], 
+                    mergedColors[net$blockGenes[[1]]],
+                    "Module colors",
+                    dendroLabels = FALSE, 
+                    hang = 0.03,
+                    addGuide = TRUE, 
+                    guideHang = 0.05)
+
+moduleLabels = net$colors
+
+moduleColors =labels2colors(net$colors, 
+                            zeroIsGrey = TRUE, 
+                            colorSeq = c("steelblue", "darkgreen", "maroon"))
+
+MEs = net$MEs;
+geneTree = net$dendrograms[[1]]
+
+#Define number of genes and samples
+nGenes = ncol(Data)
+nSamples = nrow(Data)
+
+#Recalculate MEs with color labels
+MEs0 = moduleEigengenes(Data, moduleColors)$eigengenes
+
+MEs = orderMEs(MEs0)
+
+list <- c(1, 3, 4, 5)
+
+clustering <- lapply(list, function(x){
+  
+  myCol <- circlize::colorRamp2(c(-1, 0, 1), hcl_palette = "RdBu")
+  
+  meta <- data.frame(model.matrix(~0 + FC[, x]))
+  names(meta) <- gsub('FC...x.', '', colnames(meta))
+
+  moduleTraitCor = cor(MEs, meta, use = "p")
+  moduleTraitPvalue = corPvalueStudent(moduleTraitCor, 
+                                       nSamples)
+  
+  # Print correlation heatmap between modules and traits
+  textMatrix = paste(signif(moduleTraitCor, 
+                            2), 
+                     "\n(",
+                     signif(moduleTraitPvalue, 
+                            1), 
+                     ")", 
+                     sep = "")
+  
+  dim(textMatrix) = dim(moduleTraitCor)
+  
+  w <- ifelse(x == '1', 1500, 1000)
+  
+  tiff(paste0(colnames(FC)[x], '_plot.tiff'), 
+       width = w,
+       height = 500)
+  
+  par(mar = c(8, 8.5, 3, 3) + .1)
+  
+  my_palette <- colorRampPalette(c("tomato", "white", 'dodgerblue1'))(n = 100)
+  
+  # Display the correlation values with a heatmap plot
+  labeledHeatmap(Matrix = moduleTraitCor,
+                 xLabels = colnames(moduleTraitCor),
+                 yLabels = names(MEs),
+                 ySymbols = c('Green', 'Maroon', 'Blue', 'Grey')	,
+                 colors.lab.y	 = c("darkgreen", "maroon", "steelblue", "grey20"),
+                 colorLabels = TRUE,
+                 colors = my_palette,
+                 textMatrix = textMatrix,
+                 setStdMargins = FALSE,
+                 cex.text = 1,
+                 cex.lab	= 1,
+                 zlim = c(-1,1),
+                 main = paste("Module-trait relationships"))
+  
+  dev.off()
+  
+  })
+```
+
+### Generate table describing cluster components for Figure 7
+
+```{r}
+# Construct data frame assigning each cytokine to its cluster
+moduleLabels <- data.frame(moduleLabels)
+
+table <- data.frame(Colors = c("Grey", "Blue", "Green", "Maroon"))
+
+list <- c(0, 1, 2, 3)
+
+Cytokines <- lapply(list, function(y){
+  
+  tmp <- moduleLabels %>% subset(moduleLabels == y)
+  
+  tmp <- as.character(rownames(tmp)) %>% paste(collapse=", ")
+  
+  tmp <- gsub('\\.', '-', tmp)
+  
+})
+
+table$Cytokines <- unlist(Cytokines)
+
+# Rearange table to match Figure 7 y axis and reset row names
+table <- table[c(3, 4, 2, 1), ]
+rownames(table) <- seq(1, 4, 1)
+
+#######
+
+library(htmltools)
+library(webshot)
+
+# Create function for exporting formattable object
+export_formattable <- function(f, file, width = "100%", height = NULL,
+                               background = "white", delay = 0.2)
+{
+  w <- as.htmlwidget(f, width = width, height = height)
+  path <- html_print(w, background = background, viewer = NULL)
+  url <- paste0("file:///", gsub("\\\\", "/", normalizePath(path)))
+  webshot(url,
+          file = file,
+          selector = ".formattable_widget",
+          delay = delay)
+}
+
+#######
+
+# Create formattable object describing cytokines in each cluster and export table
+export_table <- formattable(table,
+                            align = c("l", "c"),
+                            list(
+                              Colors = formatter("span", 
+                                                 style = ~ style(color = c("darkgreen", 
+                                                                           "maroon",
+                                                                           "steelblue",
+                                                                           "grey"),
+                                                                 font.weight = "bold"))))
+# Export table
+export_formattable(export_table,
+                     file = 'plot.png')
+
+```

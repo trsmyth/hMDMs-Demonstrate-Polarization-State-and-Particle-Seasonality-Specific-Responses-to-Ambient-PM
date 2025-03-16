@@ -1,0 +1,942 @@
+---
+title: "Cytotoxicity Analysis"
+author: "Timothy Smyth"
+date: "2024-03-21"
+output: html_document
+---
+
+# Analysis of CellTox Green Cyotoxicity Assay Results
+
+### Load packages
+
+```{r message = FALSE}
+rm(list = ls(all.names = TRUE)) # clears global environ.
+
+# Load packages
+library(tidyverse) # for data cleaning
+library(dplyr) # for data set manipulations
+library(stringr)
+library(ggrepel) # for pca text labeling
+library(ggplot2) # for plotting
+library(ggtext)
+library(patchwork)
+library(cowplot)
+```
+
+### Import and prepare data
+
+```{r}
+# Import data
+Celltox <- read.csv("Cytotoxicity.csv")
+
+colnames(Celltox)[1] <- 'Particle_month'
+
+# Rename particle months to full month name
+Celltox$Full_name <- paste0(Celltox$Sample.ID, "_", Celltox$Particle_month)
+Celltox <- data.frame(Celltox, row.names = Celltox$Full_name)
+Celltox <- Celltox %>% subset(select = -c(Full_name))
+
+Celltox$Particle_month[Celltox$Particle_month == 'Sept'] <- 'September'
+Celltox$Particle_month[Celltox$Particle_month == 'Dec'] <- 'December'
+
+# Retain a raw version of the Celltox data for fold change analysis below
+Celltox_Raw <- Celltox
+
+# Pivot data to long format
+Celltox <- Celltox %>% 
+  pivot_longer(cols = colnames(Celltox[3:ncol(Celltox)]),
+               names_to = 'Treatment', 
+               values_to = 'MFI')
+
+Celltox$Sample.ID <- paste0(Celltox$Sample.ID, '_', Celltox$Particle_month)
+
+Celltox$Treatment <- factor(Celltox$Treatment,
+                                 levels = c('M0_Veh', 'M2_Veh',
+                                            'M0_M1', 'M2_M1'))
+
+Celltox$Particle_month <- factor(Celltox$Particle_month,
+                                      levels = c('December', 'March', 'June', 'September'))
+
+Celltox <- Celltox %>% subset(Treatment == 'M0_Veh' |
+                                          Treatment == 'M2_Veh' |
+                                          Treatment == 'M0_M1' |
+                                          Treatment == 'M2_M1')
+```
+
+### Calculate statistics and graph results for Supplemental Figure S1C
+
+```{r}
+# Isolate Vehicle exposed samples for Supplemental Figures S1A and S1C
+Vehicle <- Celltox %>% 
+  subset(Treatment == 'M0_Veh' |
+           Treatment == 'M2_Veh' |
+           Treatment == 'M0_M1' |
+           Treatment == 'M2_M1')
+
+# Create function to calculate statistics
+statistics <- function(x){
+  
+  tmp <- x %>% 
+    arrange(Treatment) %>%    
+    mutate(Particle_month = factor(Particle_month,
+                                   levels = c('December', 'March', 'June', 'September')))
+  
+  # Run Shapiro-Wilk normality test
+  # Testing each treatment group to determine if each falls within
+  # a normal distribution for downstream statistical testing
+  Shapiro <- tmp %>%
+    group_by(Treatment) %>%
+    do(broom::tidy(shapiro.test(.$MFI)))
+
+  # If the treatment group has a normal distribution
+  # perform a paired t-test with BH correction
+  if(min(Shapiro$p.value) >= 0.05){
+    
+    # Run pairwise t-test with BH correction
+    stats <- rstatix::pairwise_t_test(MFI ~ Treatment, 
+                                      paired = TRUE, 
+                                      p.adjust.method = "BH", 
+                                      data = x)
+    
+    # Round resulting p-values to 3 digits
+    stats$adj.p.value <- round(stats$p.adj, 3)
+    
+    # Convert adjusted p values to significance symbols
+    stats <- stats %>% mutate(adj.p.value = 
+                                case_when((adj.p.value >= 0.05) ~ NA,
+                                          
+                                          (adj.p.value < 0.05 &
+                                             adj.p.value >= 0.01) ~ '*', 
+                                          
+                                          (adj.p.value < 0.01 &
+                                             adj.p.value >= 0.001) ~ '**',
+                                          
+                                          (adj.p.value < 0.001) ~ '***'))
+    
+    stats$test <- 't.test'
+    
+    stats
+    
+    } else{ # If treatment group does not have a normal distribution
+      
+      # Run a Wilcox test with BH correction
+      stats <- rstatix::pairwise_wilcox_test(MFI ~ Treatment, 
+                                    paired = TRUE, 
+                                    p.adjust.method = "BH", 
+                                    data = x)
+      
+      # Round resulting p-values to 3 digits
+      stats$adj.p.value <- round(stats$p.adj, 3)
+      
+      # Convert adjusted p values to significance symbols
+      stats <- stats %>% mutate(adj.p.value =
+                                  case_when((adj.p.value >= 0.05) ~ NA,
+                                            
+                                            (adj.p.value < 0.05 &
+                                               adj.p.value >= 0.01) ~ '*',
+                                            
+                                            (adj.p.value < 0.01 &
+                                               adj.p.value >= 0.001) ~ '**',
+                                            
+                                            (adj.p.value < 0.001) ~ '***'))
+      
+      stats$test <- 'Wilcox'
+      
+      stats
+      
+    }
+  
+  if(all(is.na(stats[, 'adj.p.value'])) == TRUE){
+      
+      stats$pos_x_1 <- 0
+      stats$pos_x_2 <- 0
+      stats$pos_x <- 0
+      stats$pos_y <- 0
+      stats
+      
+      } else{
+        
+        stats <- na.omit(stats)
+        
+        stats <- stats %>% mutate(pos_x_1 =
+                                    case_when((group1 == 'M0_Veh' | group1 == 'M0_PM') ~ 1,
+                                              (group1 == 'M2_Veh' | group1 == 'M2_PM') ~ 2,
+                                              (group1 == 'M0_M1' | group1 == 'M0_M1.PM') ~ 3, 
+                                              (group1 == 'M2_M1' | group1 == 'M2_M1.PM') ~ 4))
+        
+        stats <- stats %>% mutate(pos_x_2 =
+                                    case_when((group2 == 'M0_Veh' | group2 == 'M0_PM') ~ 1,
+                                              (group2 == 'M2_Veh' | group2 == 'M2_PM') ~ 2,
+                                              (group2 == 'M0_M1' | group2 == 'M0_M1.PM') ~ 3, 
+                                              (group2 == 'M2_M1' | group2 == 'M2_M1.PM') ~ 4))
+        
+        stats$pos_x <- (stats$pos_x_1 + stats$pos_x_2)/2
+        
+        stats$pos_y <- seq(from = 0.25,
+                           to = 0.25 * nrow(stats), 
+                           0.25)
+        
+        stats
+      }
+    }
+
+# Calculate statistics
+stats <- statistics(Vehicle)
+
+###########
+
+# Determine the maximum data value for placement of significance bars
+max <- max(Vehicle$MFI) * 1.05
+
+# Define the locations for placement of significance bars
+pos <- c(max, max * 1.15, max * 1.3, max * 1.45, max * 1.6, max * 1.75 )
+
+# Generate Supplemental Figure S1A
+Supplemental_Figure_S1C <- ggplot(data = Vehicle, 
+                                  aes(x = Treatment, 
+                                      y = MFI)) + 
+  
+  # Create a bar for each treatment group mean
+  geom_bar(aes(col = Treatment), 
+           position = position_dodge(),
+           fill = 'white', 
+           stat = "summary", 
+           fun = "mean", 
+           show.legend = FALSE) +
+  
+  # Create individual points for each data point
+  # Set data point shapes to shapes indicated above
+  geom_jitter(aes(col = Treatment),
+              width = 0.25,
+              size = 4,
+              show.legend = FALSE) + 
+  
+  # Add SEM bars
+  stat_summary(aes(col = Treatment),
+               geom = "errorbar", 
+               fun.data = mean_se, 
+               position = "dodge") +
+  
+  xlab("Treatment") +
+  
+  ylab("Cytotoxicity \n (Percent Lysis MFI)") +
+  
+  labs(fill = "Particle Month") +
+  
+  theme(axis.text.x = element_text(angle = 60, 
+                                   hjust = 1, 
+                                   face="bold", 
+                                   size = 26),
+        
+        axis.text.y = element_text(face="bold", 
+                                   size = 26), 
+        
+        axis.title.x = element_text(face = 'bold', 
+                                    size = 30), 
+        
+        axis.title.y = element_text(face = 'bold', 
+                                    size = 30),
+        
+        plot.title = element_text(face = 'bold', 
+                                  size = 20),
+        
+        legend.text = element_text(size = 20),
+        
+        legend.title = element_text(size = 20),
+        
+        plot.margin = unit(c(0, 0, 0, 0), "cm")) +
+  
+  scale_color_manual(name = 'Treatment', 
+                     breaks = c('M0_Veh', 'M2_Veh', 'M0_M1', 'M2_M1'),
+                     values = c('M0_Veh' = 'blue', 'M2_Veh' = 'red', 
+                                'M0_M1' = 'darkgreen', 'M2_M1' = 'purple'))
+
+###########
+
+Supplemental_Figure_S1C_Statistics <- ggplot(data = stats, 
+                                             aes(x = group1,
+                                                 y = pos_y)) +
+  
+  geom_segment(data = na.omit(stats), 
+               aes(x = group1, 
+                   xend = group2,
+                   y = pos_y, 
+                   yend = pos_y), 
+               colour = "black", 
+               linewidth = 1.25) +
+  
+  geom_text(data = stats,
+            label = stats$adj.p.value,
+            x = stats$pos_x,
+            y = stats$pos_y,
+            size = 14,
+            colour = "black") +
+  
+  ylab("Cytotoxicity \n (Percent Lysis MFI)") +
+  
+  labs(fill = "Particle Month") +
+  
+  theme(axis.text.y = element_text(face="bold", 
+                                   size = 26), 
+        
+        axis.title.y = element_text(face = 'bold', 
+                                    size = 30), 
+        
+        axis.text.x = element_blank(),
+
+        axis.title.x = element_blank(),
+
+        plot.margin = unit(c(0, 0, 0, 0), "cm")) +
+
+  scale_x_discrete(limits = c('M0_Veh', 'M2_Veh', 'M0_M1', 'M2_M1')) +
+  scale_y_continuous(limits = c(0, max(stats$pos_y) + 0.25))
+
+##########
+
+tiff('Supplemental_Figure_S1C.tiff', height = 1000, width = 1500)
+
+wrap_plots(Supplemental_Figure_S1C_Statistics +  
+             theme_void(),
+           Supplemental_Figure_S1C + 
+             theme(legend.position = "none"), 
+           ncol = 1,
+           heights = c(0.4, 2)) %>% 
+  ggdraw()
+
+dev.off()
+
+```
+
+### Calculate statistics and graph results for Supplemental Figure S1D
+
+```{r}
+Month_stats <- c('M0_Veh', 'M2_Veh', 'M0_M1', 'M2_M1')
+
+# Create function to calculate statistics
+Month_statistics <- function(x){
+  
+    tmp <- x %>% 
+    arrange(Treatment) %>%    
+    mutate(Particle_month = factor(Particle_month,
+                                   levels = c('December', 'March', 'June', 'September')))
+  
+  # Run Shapiro-Wilk normality test 
+  # Testing each particle month within a single treatment group to determine 
+  # if each falls within a normal distribution for downstream statistical testing  
+  Shapiro <- tmp %>%
+    group_by(Particle_month) %>% 
+    do(broom::tidy(shapiro.test(.$MFI)))
+  
+  # If the treatment group has a normal distribution
+  # perform a paired t-test with BH correction
+  if(min(Shapiro$p.value) >= 0.05){
+    
+    # Run pairwise t-test with BH correction
+    stats <- rstatix::pairwise_t_test(MFI ~ Particle_month, 
+                                      paired = FALSE, 
+                                      p.adjust.method = "BH", 
+                                      data = tmp)
+    
+    # Round resulting p-values to 3 digits
+    stats$adj.p.value <- round(stats$p.adj, 3)
+    
+    # Convert adjusted p values to significance symbols
+    stats <- stats %>% mutate(adj.p.value = 
+                                case_when((adj.p.value >= 0.05) ~ NA,
+                                          
+                                          (adj.p.value < 0.05 &
+                                             adj.p.value >= 0.01) ~ '*', 
+                                          
+                                          (adj.p.value < 0.01 &
+                                             adj.p.value >= 0.001) ~ '**',
+                                          
+                                          (adj.p.value < 0.001) ~ '***'))
+    
+    
+    stats$test <- 't.test'
+    stats <- stats[, -c(7)] # Remove p.sigif to retain only adj.p.value
+    stats
+           
+  } else{ # If treatment group does not have a normal distribution
+    
+    # Run a Wilcox test with BH correction
+    stats <- rstatix::pairwise_wilcox_test(MFI ~ Particle_month, 
+                                  paired = FALSE, 
+                                  p.adjust.method = "BH", 
+                                  data = x)
+    
+    # Round resulting p-values to 3 digits
+    stats$adj.p.value <- round(stats$p.adj, 3)
+    
+    # Convert adjusted p values to significance symbols
+    stats <- stats %>% mutate(adj.p.value =
+                                case_when((adj.p.value >= 0.05) ~ NA,
+                                          
+                                          (adj.p.value < 0.05 &
+                                             adj.p.value >= 0.01) ~ '*',
+                                          
+                                          (adj.p.value < 0.01 &
+                                             adj.p.value >= 0.001) ~ '**',
+                                          
+                                          (adj.p.value < 0.001) ~ '***'))
+    
+    
+    stats$test <- 'Wilcox'
+    stats <- stats[, -c(6)] # Remove p.sigif to retain only adj.p.value
+    stats
+           
+  }
+  
+}
+
+# For each particle month
+Month_stats <- lapply(Month_stats, function(x){
+  
+  # Subset each treatment
+  stats <- Vehicle %>% subset(Treatment == x)
+  
+  # Calculate statistics
+  stats <- Month_statistics(stats)
+
+  stats$Treatment <- x
+  
+  if(all(is.na(stats[, 'adj.p.value'])) == TRUE){
+         
+         stats$pos_x_1 <- 0
+         stats$pos_x_2 <- 0
+         stats$pos_x <- 0
+         stats$pos_y <- 0
+         stats
+         
+  } else{
+    
+    stats <- na.omit(stats)
+    
+    stats <- stats %>% mutate(pos_x_1 =
+                              case_when((group1 == 'December') ~ 1,
+                                        (group1 == 'March') ~ 2,
+                                        (group1 == 'June') ~ 3,
+                                        (group1 == 'September') ~ 4))
+    
+    stats <- stats %>% mutate(pos_x_2 =
+                                case_when((group2 == 'December') ~ 1,
+                                          (group2 == 'March') ~ 2,
+                                          (group2 == 'June') ~ 3, 
+                                          (group2 == 'September') ~ 4))
+    
+    stats$pos_x <- (stats$pos_x_1 + stats$pos_x_2)/2
+    
+    stats$pos_y <- seq(from = 0.25,
+                       to = 0.25 * nrow(stats), 
+                       0.25)
+    stats
+    
+  }
+})
+
+# Combine the statistics into one place
+Month_stats <- do.call(rbind, Month_stats)
+
+# Determine the maximum data point
+max <- max(Vehicle$MFI)
+
+# Define the locations for placement of significance bars
+pos <- rep(c(max, max * 1.05, max * 1.1, max * 1.15, max * 1.2, max * 1.25 ), 4)
+
+# Define the shapes of each data point
+# Shapes are shared between biological replicates between treatment groups
+shapes <- c(15, 15, 15, 16,
+            15, 16, 16, 17, 18,
+            17, 17, 18, 12, 12,
+            16, 17, 18, 18)
+
+# Generate Supplemental Figure S1C
+Supplemental_Figure_S1D <- ggplot(data = Vehicle, 
+                                  aes(x = Particle_month, 
+                                      y = MFI, 
+                                      fill = Treatment), 
+                                  show.legend = FALSE) +
+  
+  # Create a bar for each particle month within each treatment group
+  geom_bar(aes(col = Particle_month), 
+           position = position_dodge(),
+           fill = 'white', 
+           stat = "summary", 
+           fun = "mean", 
+           show.legend = FALSE) +
+  
+  # Create individual points for each data point
+  # Set data point shapes to shapes indicated above
+  geom_point(aes(col = Particle_month,
+                 shape = Sample.ID), 
+             stat = "identity",
+             position = position_dodge(width = .9), 
+             alpha = .8,
+             size = 5, 
+             show.legend = FALSE) + 
+  
+  # Add SEM bars
+  stat_summary(geom = "errorbar", 
+               fun.data = mean_se, 
+               position = "dodge") +
+  
+  xlab("Treatment") +
+  
+  ylab("Cytotoxicity \n (Percent Lysis MFI)") +
+  
+  labs(fill = "Particle Month") +
+  
+  facet_wrap(~factor(Treatment,
+                     c('M0_Veh', 'M2_Veh', 'M0_M1', 'M2_M1')),
+             nrow = 1) +
+  
+  theme(axis.text.x = element_text(angle = 60, 
+                                   hjust = 1, 
+                                   face="bold", 
+                                   size = 26),
+        
+        axis.text.y = element_text(face="bold", 
+                                   size = 26), 
+        
+        axis.title.x = element_text(face = 'bold', 
+                                    size = 30), 
+        
+        axis.title.y = element_text(face = 'bold', 
+                                    size = 30), 
+        
+        plot.title = element_text(face = 'bold', 
+                                  size = 20),
+        
+        legend.text = element_text(size = 20),
+        
+        legend.title = element_text(size = 20),
+        
+        plot.margin = unit(c(0, 0, 0, 0), "cm")) +
+  
+  scale_color_manual(name = 'Particle Month', 
+                     breaks = c('December', 'March', 'June', 'September'),
+                     values = c('December' = 'blue', 'March' = 'red', 
+                                'June' = 'darkgreen', 'September' = 'purple')) +
+  
+  scale_shape_manual(values = shapes)
+
+###########
+
+Supplemental_Figure_S1D_Statistics <- ggplot(data = Month_stats, 
+                                             aes(x = group1,
+                                                 y = pos_y)) +
+  
+  geom_segment(data = na.omit(Month_stats),
+               aes(x = group1,
+                   xend = group2,
+                   y = pos_y,
+                   yend = pos_y),
+               colour = "black",
+               linewidth = 1.25) +
+  
+  geom_text(data = Month_stats,
+            label = Month_stats$adj.p.value,
+            x = Month_stats$pos_x,
+            y = Month_stats$pos_y,
+            size = 14,
+            colour = "black") +
+  
+  ylab("Cytotoxicity \n (Percent Lysis MFI)") +
+  
+  labs(fill = "Particle Month") +
+  
+  facet_wrap(~factor(Treatment,
+                     c('M0_Veh', 'M2_Veh', 'M0_M1', 'M2_M1')),
+             nrow = 1) +
+  
+  theme(axis.text.y = element_text(face="bold", 
+                                   size = 26), 
+        
+        axis.title.y = element_text(face = 'bold', 
+                                    size = 30), 
+        
+        axis.text.x = element_blank(),
+        
+        axis.title.x = element_blank(),
+        
+        plot.margin = unit(c(0, 0, 0, 0), "cm")) +
+  
+  scale_x_discrete(limits = c('December', 'March', 'June', 'September')) +
+  scale_y_continuous(limits = c(0, max(Month_stats$pos_y) + 0.25))
+
+##########
+
+tiff('Supplemental_Figure_S1D.tiff', height = 1000, width = 1500)
+
+patchwork::wrap_plots(Supplemental_Figure_S1D_Statistics +  
+                        theme_void(), 
+                      Supplemental_Figure_S1D + 
+                        theme(strip.text.x = element_text(size = 25)), 
+                      ncol = 1,
+                      heights = c(0.4, 2)) %>% 
+  ggdraw()
+
+dev.off()
+```
+
+### Calculate the fold change Celltox MFI of PM exposed samples versus vehicle exposed samples
+
+```{r}
+# Isolate individual PM treatments and matched vehicle controls
+M0_Veh <- Celltox_Raw %>% select(all_of(c('M0_Veh', 'M0_PM')))
+M2_Veh <- Celltox_Raw %>% select(all_of(c('M2_Veh', 'M2_PM')))
+M0_M1 <- Celltox_Raw %>% select(all_of(c('M0_M1', 'M0_M1.PM')))
+M2_M1 <- Celltox_Raw %>% select(all_of(c('M2_M1', 'M2_M1.PM')))
+
+list <- list(M0_Veh, M2_Veh, M0_M1, M2_M1)
+
+# Calculate the fold change versus corresponding vehicle
+FC <- lapply(list, function(x){
+  
+  tmp <- data.frame(x[, 2]/x[, 1])
+  
+})
+
+# Combine all data to one location, set group names, and add sample information
+FC <- do.call(cbind, FC)
+names <- c('M0_PM', 'M2_PM', 'M0_M1.PM', 'M2_M1.PM')
+colnames(FC) <- names
+rownames(FC) <- rownames(Celltox_Raw)
+FC <- data.frame(Celltox_Raw[1:2], FC)
+
+# Set fold change data to long format
+FC <- FC %>% 
+  pivot_longer(cols = names, 
+               names_to = 'Treatment',
+               values_to = 'MFI')
+
+FC$Sample.ID <- paste0(FC$Sample.ID, 
+                       '_', 
+                       FC$Particle_month)
+
+FC$Treatment <- factor(FC$Treatment, 
+                       levels = c('M0_PM', 'M2_PM',
+                                  'M0_M1.PM', 'M2_M1.PM'))
+
+FC$Particle_month <- factor(FC$Particle_month, 
+                            levels = c('December', 'March', 'June', 'September'))
+
+save(FC, 
+     file = 'Fold_Change_Cytotoxicity.RData')
+```
+
+### Calculate statistics and graph results for Figure 1C
+
+```{r}
+# Calculate statistics
+stats <- statistics(FC)
+
+# Determine the maximum data value for placement of significance bars
+max <- max(FC$MFI)
+
+# Define the locations for placement of significance bars
+pos <- c(max, max * 1.05, max * 1.1, max * 1.15, max * 1.2, max * 1.25 )
+
+# Generate Supplemental Figure S1A
+Figure_1C <- ggplot(data = FC, 
+                    aes(x = Treatment, 
+                        y = MFI)) + 
+  
+  # Create a bar for each treatment group mean
+  geom_bar(aes(col = Treatment), 
+           position = position_dodge(),
+           fill = 'white', 
+           stat = "summary", 
+           fun = "mean", 
+           show.legend = FALSE) +
+  
+  # Create individual points for each data point
+  # Set data point shapes to shapes indicated above
+  geom_jitter(aes(col = Treatment),
+              width = 0.25,
+              size = 4,
+              show.legend = FALSE) + 
+  
+  # Add SEM bars
+  stat_summary(aes(col = Treatment),
+               geom = "errorbar", 
+               fun.data = mean_se, 
+               position = "dodge") +
+  
+  xlab("Treatment") +
+  
+  ylab("Fold Change Vehicle Cytotoxicity \n (Percent Lysis MFI)") +
+  
+  labs(fill = "Particle Month") +
+  
+  theme(axis.text.x = element_text(angle = 60, 
+                                   hjust = 1, 
+                                   face="bold", 
+                                   size = 26),
+        
+        axis.text.y = element_text(face="bold", 
+                                   size = 26), 
+        
+        axis.title.x = element_text(face = 'bold', 
+                                    size = 30), 
+        
+        axis.title.y = element_text(face = 'bold', 
+                                    size = 30),
+        
+        plot.title = element_text(face = 'bold', 
+                                  size = 20),
+        
+        legend.text = element_text(size = 20),
+        
+        legend.title = element_text(size = 20),
+        
+        plot.margin = unit(c(0, 0, 0, 0), "cm")) +
+  
+  scale_color_manual(name = 'Treatment', 
+                     breaks = c('M0_PM', 'M2_PM', 'M0_M1.PM', 'M2_M1.PM'),
+                     values = c('M0_PM' = 'blue', 'M2_PM' = 'red', 
+                                'M0_M1.PM' = 'darkgreen', 'M2_M1.PM' = 'purple'))
+
+###########
+
+Figure_1C_Statistics <- ggplot(data = stats, 
+                               aes(x = group1,
+                                   y = pos_y)) +
+  
+  geom_segment(data = na.omit(stats), 
+               aes(x = group1, 
+                   xend = group2,
+                   y = pos_y, 
+                   yend = pos_y), 
+               colour = "black", 
+               linewidth = 1.25) +
+  
+  geom_text(data = stats,
+            label = stats$adj.p.value,
+            x = stats$pos_x,
+            y = stats$pos_y,
+            size = 15,
+            colour = "black") +
+  
+  ylab("Fold Change Vehicle Cytotoxicity \n (Percent Lysis MFI)") +
+  
+  labs(fill = "Particle Month") +
+  
+  theme(axis.text.y = element_text(face="bold", 
+                                   size = 26), 
+        
+        axis.title.y = element_text(face = 'bold', 
+                                    size = 30), 
+        
+        axis.text.x = element_blank(),
+
+        axis.title.x = element_blank(),
+
+        plot.margin = unit(c(0, 0, 0, 0), "cm")) +
+
+  scale_x_discrete(limits = c('M0_PM', 'M2_PM',
+                              'M0_M1.PM', 'M2_M1.PM')) +
+  scale_y_continuous(limits = c(0, max(stats$pos_y) + 0.25))
+
+##########
+
+tiff('Figure_1C.tiff', height = 1000, width = 1500)
+
+wrap_plots(Figure_1C_Statistics +  
+             theme_void(),
+           Figure_1C + 
+             theme(legend.position = "none"), 
+           ncol = 1,
+           heights = c(0.4, 2)) %>% 
+  ggdraw()
+
+dev.off()
+```
+
+### Calculate statistics and graph results for Figure 1D
+
+```{r}
+Month_stats <- c('M0_PM', 'M2_PM', 'M0_M1.PM', 'M2_M1.PM')
+
+# For each particle month
+Month_stats <- lapply(Month_stats, function(x){
+  
+  # Subset each treatment
+  stats <- FC %>% subset(Treatment == x)
+  
+  # Calculate statistics
+  stats <- Month_statistics(stats)
+
+  stats$Treatment <- x
+  
+  if(all(is.na(stats[, 'adj.p.value'])) == TRUE){
+         
+         stats$pos_x_1 <- 0
+         stats$pos_x_2 <- 0
+         stats$pos_x <- 0
+         stats$pos_y <- 0
+         stats
+         
+  } else{
+    
+    stats <- na.omit(stats)
+    
+    stats <- stats %>% mutate(pos_x_1 =
+                              case_when((group1 == 'December') ~ 1,
+                                        (group1 == 'March') ~ 2,
+                                        (group1 == 'June') ~ 3,
+                                        (group1 == 'September') ~ 4))
+    
+    stats <- stats %>% mutate(pos_x_2 =
+                                case_when((group2 == 'December') ~ 1,
+                                          (group2 == 'March') ~ 2,
+                                          (group2 == 'June') ~ 3, 
+                                          (group2 == 'September') ~ 4))
+    
+    stats$pos_x <- (stats$pos_x_1 + stats$pos_x_2)/2
+    
+    stats$pos_y <- seq(from = 0.25,
+                       to = 0.25 * nrow(stats), 
+                       0.25)
+    stats
+    
+  }
+})
+
+# Combine the statistics into one place
+Month_stats <- do.call(rbind, Month_stats)
+
+# Determine the maximum data point
+max <- max(FC$MFI)
+
+# Define the locations for placement of significance bars
+pos <- rep(c(max, max * 1.05, max * 1.1, max * 1.15, max * 1.2, max * 1.25 ), 4)
+
+# Generate Supplemental Figure S1C
+Figure_1D <- ggplot(data = FC, 
+                    aes(x = Particle_month, 
+                        y = MFI, 
+                        fill = Treatment), 
+                    show.legend = FALSE) + 
+  
+  # Create a bar for each particle month within each treatment group
+  geom_bar(aes(col = Particle_month), 
+           position = position_dodge(),
+           fill = 'white', 
+           stat = "summary", 
+           fun = "mean", 
+           show.legend = FALSE) +
+  
+  # Create individual points for each data point
+  # Set data point shapes to shapes indicated above
+  geom_point(aes(col = Particle_month, 
+                 shape = Sample.ID), 
+             stat = "identity",
+             position = position_dodge(width = .9), 
+             alpha = .8,
+             size = 6, 
+             show.legend = FALSE) + 
+
+  # Add SEM bars
+  stat_summary(geom = "errorbar", 
+               fun.data = mean_se, 
+               position = "dodge") +
+  
+  xlab("Treatment") +
+  
+  ylab("Fold Change Vehicle Cytotoxicity \n (Percent Lysis MFI)") +
+  
+  labs(fill = "Particle Month") +
+  
+  facet_wrap(~factor(Treatment,
+                     c('M0_PM', 'M2_PM', 'M0_M1.PM', 'M2_M1.PM')),
+             nrow = 1) +
+
+  theme(axis.text.x = element_text(angle = 60, 
+                                   hjust = 1, 
+                                   face="bold", 
+                                   size = 26),
+        
+        axis.text.y = element_text(face="bold", 
+                                   size = 26), 
+        
+        axis.title.x = element_text(face = 'bold', 
+                                    size = 30), 
+        
+        axis.title.y = element_text(face = 'bold', 
+                                    size = 30),
+        
+        plot.title = element_text(face = 'bold', 
+                                  size = 20),
+        
+        legend.text = element_text(size = 20),
+        
+        legend.title = element_text(size = 20),
+        
+        plot.margin = unit(c(0, 0, 0, 0), "cm")) +
+  
+  scale_color_manual(name = 'Particle Month', 
+                     breaks = c('December', 'March', 'June', 'September'),
+                     values = c('December' = 'blue', 'March' = 'red', 
+                                'June' = 'darkgreen', 'September' = 'purple')) +
+  
+  scale_shape_manual(values = shapes)
+
+###########
+
+Figure_1D_Statistics <- ggplot(data = Month_stats, 
+                               aes(x = Month,
+                                   y = pos_y)) +
+  
+  geom_segment(data = na.omit(Month_stats),
+               aes(x = group1,
+                   xend = group2,
+                   y = pos_y,
+                   yend = pos_y),
+               colour = "black",
+               linewidth = 1.25) +
+  
+  geom_text(data = Month_stats,
+            label = Month_stats$adj.p.value,
+            x = Month_stats$pos_x,
+            y = Month_stats$pos_y,
+            size = 15,
+            colour = "black") +
+  
+  ylab("Fold Change Vehicle Cytotoxicity \n (Percent Lysis MFI)") +
+  
+  labs(fill = "Particle Month") +
+  
+  facet_wrap(~factor(Treatment,
+                     c('M0_PM', 'M2_PM', 'M0_M1.PM', 'M2_M1.PM')),
+             nrow = 1) +
+  
+  theme(axis.text.y = element_text(face="bold", 
+                                   size = 26), 
+        
+        axis.title.y = element_text(face = 'bold', 
+                                    size = 30), 
+        
+        axis.text.x = element_blank(),
+        
+        axis.title.x = element_blank(),
+        
+        plot.margin = unit(c(0, 0, 0, 0), "cm")) +
+  
+  scale_x_discrete(limits = c('December', 'March', 'June', 'September')) +
+  scale_y_continuous(limits = c(0, max(Month_stats$pos_y) + 0.25))
+
+##########
+
+tiff('Figure_1D.tiff', height = 1000, width = 1500)
+
+patchwork::wrap_plots(Figure_1D_Statistics +  
+                        theme_void(), 
+                      Figure_1D + 
+                        theme(strip.text.x = element_text(size = 25)), 
+                      ncol = 1,
+                      heights = c(0.4, 2)) %>% 
+  ggdraw()
+
+dev.off()
+```
