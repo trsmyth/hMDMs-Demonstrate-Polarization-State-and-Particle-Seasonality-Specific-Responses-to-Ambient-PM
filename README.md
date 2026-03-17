@@ -6,4 +6,9 @@ DOI: https://pubs.acs.org/doi/10.1021/acs.chemrestox.4c00291.
 
 Raw data associated with this manuscript are available at: https://doi.org/10.15139/S3/PYZJWV.
 
-<img width="2997" height="1693" alt="China PM Graphical Abstract" src="https://github.com/user-attachments/assets/3f943c2d-6c9e-43ff-9ceb-d1b46b69a64c" />
+<p align="center">
+  <img width="2997" height="1693" alt="China PM Graphical Abstract" src="https://github.com/user-attachments/assets/3f943c2d-6c9e-43ff-9ceb-d1b46b69a64c" />
+</p>
+<div align="right">
+Image created using Biorender.com
+</div>
